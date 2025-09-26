@@ -1,7 +1,11 @@
 from fastapi import FastAPI
-from routers import ocr_router
+from routers.ocr_router import router as ocr_router
 
-app = FastAPI(title="OCR Meter Reader API")
+app = FastAPI(title="Meter OCR API", version="1.0")
 
-# include OCR routes
-app.include_router(ocr_router.router)
+# Routers
+app.include_router(ocr_router)
+
+@app.get("/")
+def root():
+    return {"ok": True, "service": "Meter OCR API"}

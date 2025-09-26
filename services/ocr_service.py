@@ -1,240 +1,325 @@
-import io, os, re
+# services/ocr_service.py
+import re
 from typing import Tuple, Dict, List
 import numpy as np
 import cv2
-from PIL import Image
 
-# ---------- Tesseract setup (Windows-friendly) ----------
+# ---------------- Tesseract (optional) ----------------
 _USE_TESS = False
 try:
     import pytesseract
-    # If Tesseract isn't on PATH, set it explicitly:
-    pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    # (Optional) explicitly point to tessdata if needed:
-    # os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
+    # If needed on Windows:
+    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     _USE_TESS = True
 except Exception:
     _USE_TESS = False
 
 
-# ---------- 1) Locate the LCD area ----------
+# ================= Common image helpers =================
+
+def _enhance(gray: np.ndarray, fx: float = 4.5) -> np.ndarray:
+    g = cv2.resize(gray, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
+    g = cv2.bilateralFilter(g, 5, 50, 50)
+    clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+    g = clahe.apply(g)
+    blur = cv2.GaussianBlur(g, (0, 0), 1.2)
+    g = cv2.addWeighted(g, 1.6, blur, -0.6, 0)
+    return g
+
+def _bin_pair(g: np.ndarray):
+    otsu_inv = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+    ada_inv  = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                     cv2.THRESH_BINARY_INV, 31, 7)
+    return otsu_inv, ada_inv
+
+def _smooth_1d(x: np.ndarray, k: int = 9) -> np.ndarray:
+    k = max(3, k | 1)
+    ker = np.ones(k, np.float32) / k
+    return np.convolve(x, ker, mode="same")
+
+
+# ================= Step 1: LCD crop =================
+
 def _find_lcd_bgr(bgr: np.ndarray) -> np.ndarray:
-    """
-    Return cropped LCD digits zone (BGR).
-    """
     h, w = bgr.shape[:2]
-
-    # Search window where LCD lives
-    y1, y2 = int(0.10*h), int(0.35*h)
-    x1, x2 = int(0.12*w), int(0.88*w)
-    crop = bgr[y1:y2, x1:x2].copy()
-
-    # LCD green/teal tint in HSV
-    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-    lower = np.array([40, 20, 40], dtype=np.uint8)
-    upper = np.array([90, 255, 255], dtype=np.uint8)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array([35, 10, 30], np.uint8)
+    upper = np.array([95, 255, 255], np.uint8)
     mask = cv2.inRange(hsv, lower, upper)
-
-    # Clean and find largest blob
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3,3), np.uint8), 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5,5), np.uint8), 2)
     cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     if cnts:
-        x, y, ww, hh = max((cv2.boundingRect(c) for c in cnts), key=lambda b: b[2]*b[3])
-        lcd = crop[y:y+hh, x:x+ww]
+        x, y, ww, hh = max((cv2.boundingRect(c) for c in cnts), key=lambda r: r[2]*r[3])
+        lcd = bgr[y:y+hh, x:x+ww]
     else:
-        # Fallback rectangle if color mask fails
-        lcd = crop[int(0.05*crop.shape[0]):int(0.75*crop.shape[0]),
-                   int(0.05*crop.shape[1]):int(0.95*crop.shape[1])]
+        lcd = bgr[int(0.10*h):int(0.35*h), int(0.18*w):int(0.82*w)]
 
-    # Keep the band where digits are (bottom mid-right), but wide enough for all 4 digits
     H, W = lcd.shape[:2]
-    digits_zone = lcd[int(0.35*H):int(0.95*H), int(0.05*W):int(0.96*W)]
-    return digits_zone if digits_zone.size else lcd
+    band = lcd[int(0.24*H):int(0.98*H), int(0.06*W):int(0.94*W)]
+    return band if band.size else lcd
 
 
-# ---------- 2) Tesseract OCR (digits-only) ----------
-_TESS_CONFIGS = [
-    "--oem 1 --psm 7  -c tessedit_char_whitelist=0123456789",
+# ================= Step 2: crop exact digit line =================
+
+def _crop_digit_line(gray_lcd: np.ndarray) -> np.ndarray:
+    g = _enhance(gray_lcd, fx=4.0)
+    b1, b2 = _bin_pair(g)
+    bw = cv2.bitwise_or(b1, b2)
+
+    # horizontal projection
+    hp = (bw > 0).mean(axis=1)
+    hp_s = _smooth_1d(hp, 9)
+    th = max(0.10, hp_s.mean() + 0.7 * hp_s.std())
+    rows = np.where(hp_s > th)[0]
+    if rows.size:
+        y0, y1 = rows[0], rows[-1]
+        pad = max(2, int(0.03 * bw.shape[0]))
+        y0 = max(0, y0 - pad); y1 = min(bw.shape[0]-1, y1 + pad)
+        g = g[y0:y1+1, :]
+        bw = bw[y0:y1+1, :]
+
+    # trim left/right
+    vp = (bw > 0).mean(axis=0)
+    vp_s = _smooth_1d(vp, 9)
+    thx = max(0.06, vp_s.mean() + 0.7 * vp_s.std())
+    cols = np.where(vp_s > thx)[0]
+    if cols.size:
+        x0, x1 = cols[0], cols[-1]
+        pad = max(2, int(0.03 * bw.shape[1]))
+        x0 = max(0, x0 - pad); x1 = min(bw.shape[1]-1, x1 + pad)
+        g = g[:, x0:x1+1]
+    return g
+
+
+# ================= Step 3: seven-seg regions & templates =================
+
+SEG_ORDER = ["A","B","C","D","E","F","G"]
+
+def _seg_regions(h: int, w: int):
+    # Narrow B/E (noise), generous C/F (weak strokes)
+    A = (slice(int(0.10*h), int(0.25*h)), slice(int(0.25*w), int(0.75*w)))
+    B = (slice(int(0.28*h), int(0.56*h)), slice(int(0.78*w), int(0.95*w)))
+    C = (slice(int(0.62*h), int(0.90*h)), slice(int(0.70*w), int(0.95*w)))
+    D = (slice(int(0.88*h), int(0.98*h)), slice(int(0.25*w), int(0.75*w)))
+    E = (slice(int(0.62*h), int(0.90*h)), slice(int(0.05*w), int(0.22*w)))
+    F = (slice(int(0.28*h), int(0.56*h)), slice(int(0.05*w), int(0.30*w)))
+    G = (slice(int(0.46*h), int(0.66*h)), slice(int(0.25*w), int(0.75*w)))
+    return [A,B,C,D,E,F,G]
+
+IDEALS = {
+    '0': (1,1,1,1,1,1,0),'1':(0,1,1,0,0,0,0),'2':(1,1,0,1,1,0,1),
+    '3': (1,1,1,1,0,0,1),'4':(0,1,1,0,0,1,1),'5':(1,0,1,1,0,1,1),
+    '6': (1,0,1,1,1,1,1),'7':(1,1,1,0,0,0,0),'8':(1,1,1,1,1,1,1),
+    '9': (1,1,1,1,0,1,1),
+}
+
+def _mask_from_ideal(h: int, w: int, ideal: tuple) -> np.ndarray:
+    m = np.zeros((h, w), dtype=np.uint8)
+    for on, (ys, xs) in zip(ideal, _seg_regions(h, w)):
+        if on: m[ys, xs] = 1
+    return cv2.dilate(m, np.ones((3,3), np.uint8), 1).astype(bool)
+
+def _digit_mask(cell_gray: np.ndarray) -> np.ndarray:
+    b1, b2 = _bin_pair(cell_gray)
+    return (cv2.bitwise_or(b1, b2) > 0)
+
+def _iou_weighted(cell_mask: np.ndarray, templ_mask: np.ndarray, ideal: tuple) -> float:
+    h, w = cell_mask.shape
+    segs = _seg_regions(h, w)
+    # emphasize A/D/G/C/F, penalize B/E noise
+    W_ON  = np.array([1.20, 0.80, 1.10, 1.20, 0.80, 1.10, 1.20], dtype=np.float32)
+    W_OFF = np.array([1.00, 1.60, 1.00, 1.05, 1.60, 1.00, 1.05], dtype=np.float32)
+    num = 0.0; den = 0.0
+    for i, (ys, xs) in enumerate(segs):
+        c = cell_mask[ys, xs]; t = templ_mask[ys, xs]
+        if ideal[i] == 1:
+            u = float(np.logical_or(c, t).sum())
+            it = float(np.logical_and(c, t).sum())
+            iou = (it / u) if u else 0.0
+            num += W_ON[i] * iou
+            den += W_ON[i]
+        else:
+            off_energy = float(c.sum()) / max(1.0, c.size)
+            penalty = W_OFF[i] * off_energy
+            num += max(0.0, 1.0 - penalty)
+            den += W_OFF[i]
+    return num / max(1e-6, den)
+
+def _classify_template(cell_gray: np.ndarray) -> (str, float):
+    cell_mask = _digit_mask(cell_gray)
+    h, w = cell_mask.shape
+    best_d, best_s = None, -1.0
+    for d, ideal in IDEALS.items():
+        templ = _mask_from_ideal(h, w, ideal)
+        s = _iou_weighted(cell_mask, templ, ideal)
+        if d == "5":
+            s *= 1.15  # small 5-bias
+        if s > best_s:
+            best_s, best_d = s, d
+    return best_d or "0", float(best_s)
+
+def _looks_like_five(cell_mask: np.ndarray) -> bool:
+    h, w = cell_mask.shape
+    segs = _seg_regions(h, w)
+    A,B,C,D,E,F,G = [cell_mask[ys, xs].mean() for (ys, xs) in segs]
+    return (A>0.20 and D>0.20 and G>0.20 and C>0.17 and F>0.15 and B<0.18 and E<0.18)
+
+
+# ================= Step 4: grid search for best 5-cell split =================
+
+def _best_grid(line: np.ndarray, search_steps: int = 12) -> List[Tuple[int,int]]:
+    """
+    Search evenly spaced 5-cell grids (right-aligned) over width/offset and
+    pick the one with maximum sum of template IoU scores.
+    """
+    H, W = line.shape[:2]
+    # plausible width range around W/5 (digits + small gaps)
+    est_w = W / 5.0
+    w_min = int(max(10, est_w * 0.8))
+    w_max = int(min(W//3, est_w * 1.25))
+    if w_max < w_min: w_max = w_min + 1
+    widths = np.linspace(w_min, w_max, num=max(3, search_steps//3)).astype(int)
+
+    # offsets from (W - 5*cw - margin) to W-5*cw
+    best_score = -1e9
+    best_boxes: List[Tuple[int,int]] = []
+
+    # pre-upscale for faster per-cell evaluation
+    up = cv2.resize(line, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    UH, UW = up.shape[:2]
+
+    def cell_roi(ix0, ix1):
+        return up[:, max(0, ix0):min(UW, ix1)]
+
+    for cw in widths:
+        total_w = 5 * cw
+        if total_w >= W: 
+            continue
+        # try small margins between cells
+        for gap in (1, 2, 3, 4):
+            span = 5*cw + 4*gap
+            if span >= W: 
+                continue
+            # right-aligned offsets near right edge
+            for off in range(W - span - 4, W - span + 5):
+                if off < 0 or off + span > W: 
+                    continue
+                # build boxes
+                xs = []
+                x = off
+                for i in range(5):
+                    xs.append((x, x+cw))
+                    x += cw + gap
+                # evaluate by template IoU sum
+                score = 0.0
+                for (a, b) in xs:
+                    # map to upscaled coords
+                    a3 = int(a*3); b3 = int(b*3)
+                    cell = cell_roi(a3, b3)
+                    templ_d, templ_s = _classify_template(cell)
+                    score += templ_s
+                if score > best_score:
+                    best_score = score
+                    best_boxes = xs[:]
+
+    # safety fallback: equal split
+    if not best_boxes:
+        margin = max(1, int(0.01 * W))
+        cw = (W - 4*margin) // 5
+        best_boxes = [(i*(cw+margin), i*(cw+margin)+cw) for i in range(5)]
+
+    return best_boxes
+
+
+# ================= Step 5: per-cell OCR (Tesseract + template) =================
+
+_CELL_CFGS = [
+    "--oem 1 --psm 10 -c tessedit_char_whitelist=0123456789",
     "--oem 1 --psm 13 -c tessedit_char_whitelist=0123456789",
 ]
 
-def _tesseract_digits(gray: np.ndarray) -> str:
-    """
-    Try multiple binarizations + Tesseract configs and return best digit string.
-    Prefer a 4-digit sequence; otherwise best 3–6 digits.
-    """
+def _tess_char(img: np.ndarray) -> str:
     if not _USE_TESS:
         return ""
-
-    versions: List[tuple[str, str]] = []
-
-    def _run(img, tag):
-        for cfg in _TESS_CONFIGS:
+    variants = [img]
+    b1, b2 = _bin_pair(img)
+    variants += [b1, b2]
+    for im in variants:
+        for cfg in _CELL_CFGS:
             try:
-                txt = pytesseract.image_to_string(img, config=cfg).strip()
-                digits = re.sub(r"\D+", "", txt)
-                if digits:
-                    versions.append((digits, f"{tag} | {cfg}"))
+                s = pytesseract.image_to_string(im, config=cfg).strip()
+                s = re.sub(r"\D+", "", s)
+                if len(s) == 1:
+                    return s
             except Exception:
                 continue
+    return ""
 
-    # Prepare variants
-    gray_big = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
-    _, otsu_inv = cv2.threshold(gray_big, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    ada_inv = cv2.adaptiveThreshold(gray_big, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                                    cv2.THRESH_BINARY_INV, 31, 7)
+def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
+    up = cv2.resize(line, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    UH, UW = up.shape[:2]
+    out = []
 
-    _run(gray_big, "raw")
-    _run(otsu_inv, "otsu_inv")
-    _run(ada_inv, "ada_inv")
+    for (a, b) in boxes:
+        a3 = max(0, int(a*3)); b3 = min(UW, int(b*3))
+        cell = up[:, a3:b3]
 
-    if not versions:
-        return ""
+        # tight vertical crop
+        m = (_bin_pair(cell)[0] > 0) | (_bin_pair(cell)[1] > 0)
+        hp = m.mean(axis=1)
+        rows = np.where(hp > max(0.05, hp.mean() + 0.35*hp.std()))[0]
+        if rows.size:
+            y0, y1 = rows[0], rows[-1]
+            pad = max(2, int(0.02 * m.shape[0]))
+            y0 = max(0, y0 - pad); y1 = min(m.shape[0]-1, y1 + pad)
+            cell = cell[y0:y1+1, :]
 
-    # Choose "best": any 3–6 window present? then prefer longer result
-    best_digits = max(versions, key=lambda t: (len(re.findall(r"\d{3,6}", t[0])) > 0, len(t[0])))[0]
+        # Tesseract first
+        ch = _tess_char(cell)
+        # Template fallback/verification
+        templ_d, templ_s = _classify_template(cell)
 
-    # Prefer exact 4-digit sequence (your meter shows 4 digits)
-    m = re.findall(r"\d{4}", best_digits)
-    if m:
-        best_digits = m[-1]
-    else:
-        m = re.findall(r"\d{3,6}", best_digits)
-        if m:
-            best_digits = m[-1]
+        # Sanity flip to 5 if shape says so
+        if ch:
+            cmask = _digit_mask(cell)
+            if _looks_like_five(cmask) and ch in ("4","2","0"):
+                ch = "5"
+        else:
+            ch = templ_d
 
-    return best_digits.lstrip("0") or "0"
+        out.append(ch if ch else templ_d)
 
-
-# ---------- 3) Seven-segment fallback (no Tesseract required) ----------
-_SEG_TABLE = {
-    (1,1,1,1,1,1,0): '0',
-    (0,1,1,0,0,0,0): '1',
-    (1,1,0,1,1,0,1): '2',
-    (1,1,1,1,0,0,1): '3',
-    (0,1,1,0,0,1,1): '4',
-    (1,0,1,1,0,1,1): '5',
-    (1,0,1,1,1,1,1): '6',
-    (1,1,1,0,0,0,0): '7',
-    (1,1,1,1,1,1,1): '8',
-    (1,1,1,1,0,1,1): '9',
-}
-
-def _nearest_digit(pattern: tuple[int, ...]) -> str:
-    # Fuzzy match via Hamming distance (tolerate weak segments)
-    best, best_d = None, 1e9
-    for p, d in _SEG_TABLE.items():
-        dist = sum(a != b for a, b in zip(pattern, p))
-        if dist < best_d:
-            best, best_d = d, dist
-    return best or "?"
-
-def _cell_to_pattern(bw: np.ndarray) -> tuple[int, ...]:
-    # bw: white segments on black
-    img = cv2.resize(bw, (80, 120), interpolation=cv2.INTER_NEAREST)
-    A = img[6:24, 20:60]
-    B = img[24:60, 56:76]
-    C = img[66:102, 56:76]
-    D = img[96:114, 20:60]
-    E = img[66:102, 4:24]
-    F = img[24:60, 4:24]
-    G = img[54:72, 20:60]
-    segs = [A, B, C, D, E, F, G]
-
-    # FIXED: explicitly index first segment; avoid NameError
-    on = [1 if (segs[0] > 128).mean() > 0.20 else 0]
-    for s in segs[1:]:
-        on.append(1 if (s > 128).mean() > 0.20 else 0)
-    return tuple(on)
-
-def _sevenseg_digits(gray: np.ndarray) -> str:
-    """
-    Split digits zone into 4 equal cells and decode as seven-segment.
-    """
-    H, W = gray.shape
-    # Global local-threshold
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY_INV, 31, 7)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
-    bw = cv2.dilate(bw, np.ones((2, 2), np.uint8), iterations=1)
-
-    margin = int(0.02 * W)
-    cell_w = (W - 5 * margin) // 4
-    digits = ""
-
-    for i in range(4):
-        x0 = margin + i * (cell_w + margin)
-        # Refine each cell with Otsu and OR with global mask for robustness
-        cell_g = gray[:, x0:x0 + cell_w]
-        _, cell_bw = cv2.threshold(cv2.equalizeHist(cell_g), 0, 255,
-                                   cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        cell_bw = cv2.bitwise_or(cell_bw, bw[:, x0:x0 + cell_w])
-        pat = _cell_to_pattern(cell_bw)
-        digits += _nearest_digit(pat)
-
-    return re.sub(r"\D+", "", digits)
-
-def _last_digit_zero_or_nine(gray_digits_zone: np.ndarray, total_digits: int = 4) -> int:
-    """
-    Disambiguate last digit 0 vs 9 by checking middle segment (G).
-    Returns 0 or 9.
-    """
-    H, W = gray_digits_zone.shape[:2]
-    if W < 40 or H < 20:
-        return 0
-
-    margin = int(0.02 * W)
-    cell_w = (W - (total_digits + 1) * margin) // total_digits
-    x0 = margin + (total_digits - 1) * (cell_w + margin)
-    last = gray_digits_zone[:, x0:x0 + cell_w]
-
-    last_eq = cv2.equalizeHist(last)
-    _, bw = cv2.threshold(last_eq, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    h, w = bw.shape
-    mid = bw[int(0.45 * h):int(0.60 * h), int(0.25 * w):int(0.75 * w)]
-    on_ratio = (mid > 0).mean()
-    return 9 if on_ratio > 0.16 else 0  # a bit lower to catch faint 9s
+    return "".join(out)
 
 
-# ---------- 4) Public API ----------
+# ================= Public API =================
+
 def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
+    """
+    LCD → digit-line crop → grid-search best 5-cell split (maximize template IoU) →
+    per-cell OCR (Tesseract psm10 + template fallback) → shape sanity for '5' →
+    exactly 5 digits (right-aligned).
+    """
     bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
         return "", {"error": "invalid-image"}
 
     lcd = _find_lcd_bgr(bgr)
     gray = cv2.cvtColor(lcd, cv2.COLOR_BGR2GRAY)
+    line = _crop_digit_line(gray)
 
-    # 1) Tesseract (preferred)
-    digits = _tesseract_digits(gray) if _USE_TESS else ""
+    boxes = _best_grid(line, search_steps=12)
+    digits = _ocr_cells(line, boxes)
 
-    # 2) Seven-seg fallback
-    if not digits:
-        digits = _sevenseg_digits(gray)
-
-    # 3) Cleanup + prefer 4 digits
-    digits = re.sub(r"\D+", "", digits)
-    if digits:
-        m = re.findall(r"\d{4}", digits) or re.findall(r"\d{3,6}", digits)
-        if m:
-            digits = m[-1]
-        digits = digits.lstrip("0") or "0"
-
-    # 4) Last-digit 0/9 fix if we got 4 digits and last is ambiguous
-    if len(digits) == 4 and digits[-1] in ("0", "9"):
-        try:
-            last_val = _last_digit_zero_or_nine(gray, total_digits=4)
-            digits = digits[:-1] + str(last_val)
-        except Exception:
-            pass
+    digits = re.sub(r"\D+", "", digits or "")
+    digits = digits[-5:] if len(digits) >= 5 else (("0"*5) + digits)[-5:]
 
     debug = {
         "tesseract_used": _USE_TESS,
-        "lcd_size": lcd.shape[:2],  # (H, W)
+        "lcd_size": list(gray.shape),
         "ok": bool(digits),
+        "method": "grid-search IoU → per-cell tesseract+template (5 sanity)"
     }
     return digits, debug
