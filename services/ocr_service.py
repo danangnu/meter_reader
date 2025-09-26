@@ -9,7 +9,7 @@ _USE_TESS = False
 try:
     import pytesseract
     # If needed on Windows:
-    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\\tesseract.exe"
     _USE_TESS = True
 except Exception:
     _USE_TESS = False
@@ -95,8 +95,6 @@ def _crop_digit_line(gray_lcd: np.ndarray) -> np.ndarray:
 
 # ================= Step 3: seven-seg regions & templates =================
 
-SEG_ORDER = ["A","B","C","D","E","F","G"]
-
 def _seg_regions(h: int, w: int):
     # Narrow B/E (noise), generous C/F (weak strokes)
     A = (slice(int(0.10*h), int(0.25*h)), slice(int(0.25*w), int(0.75*w)))
@@ -128,7 +126,6 @@ def _digit_mask(cell_gray: np.ndarray) -> np.ndarray:
 def _iou_weighted(cell_mask: np.ndarray, templ_mask: np.ndarray, ideal: tuple) -> float:
     h, w = cell_mask.shape
     segs = _seg_regions(h, w)
-    # emphasize A/D/G/C/F, penalize B/E noise
     W_ON  = np.array([1.20, 0.80, 1.10, 1.20, 0.80, 1.10, 1.20], dtype=np.float32)
     W_OFF = np.array([1.00, 1.60, 1.00, 1.05, 1.60, 1.00, 1.05], dtype=np.float32)
     num = 0.0; den = 0.0
@@ -154,77 +151,84 @@ def _classify_template(cell_gray: np.ndarray) -> (str, float):
     for d, ideal in IDEALS.items():
         templ = _mask_from_ideal(h, w, ideal)
         s = _iou_weighted(cell_mask, templ, ideal)
-        if d == "5":
-            s *= 1.15  # small 5-bias
+        if d == "5":  # small bias
+            s *= 1.12
         if s > best_s:
             best_s, best_d = s, d
     return best_d or "0", float(best_s)
 
-def _looks_like_five(cell_mask: np.ndarray) -> bool:
+def _template_scores(cell_gray: np.ndarray) -> Dict[str, float]:
+    """Return weighted IoU scores for all digits 0–9 (same scoring as _classify_template)."""
+    cell_mask = _digit_mask(cell_gray)
     h, w = cell_mask.shape
+    scores: Dict[str, float] = {}
+    for d, ideal in IDEALS.items():
+        templ = _mask_from_ideal(h, w, ideal)
+        s = _iou_weighted(cell_mask, templ, ideal)
+        if d == "5":
+            s *= 1.12  # keep same 5-bias
+        scores[d] = float(s)
+    return scores
+
+def _looks_like_five(mask: np.ndarray) -> bool:
+    h, w = mask.shape
     segs = _seg_regions(h, w)
-    A,B,C,D,E,F,G = [cell_mask[ys, xs].mean() for (ys, xs) in segs]
+    A,B,C,D,E,F,G = [mask[ys, xs].mean() for (ys, xs) in segs]
     return (A>0.20 and D>0.20 and G>0.20 and C>0.17 and F>0.15 and B<0.18 and E<0.18)
+
+def _seg_energies(mask: np.ndarray) -> Dict[str, float]:
+    """Return per-segment on-ratios (A..G)."""
+    h, w = mask.shape
+    segs = _seg_regions(h, w)
+    vals = [mask[ys, xs].mean() for (ys, xs) in segs]
+    return dict(zip(["A","B","C","D","E","F","G"], vals))
 
 
 # ================= Step 4: grid search for best 5-cell split =================
 
-def _best_grid(line: np.ndarray, search_steps: int = 12) -> List[Tuple[int,int]]:
+def _best_grid(line: np.ndarray) -> List[Tuple[int,int]]:
     """
-    Search evenly spaced 5-cell grids (right-aligned) over width/offset and
-    pick the one with maximum sum of template IoU scores.
+    Try many right-aligned 5-cell grids (width/gap/offset) and keep the one
+    with the highest total template score.
     """
     H, W = line.shape[:2]
-    # plausible width range around W/5 (digits + small gaps)
-    est_w = W / 5.0
-    w_min = int(max(10, est_w * 0.8))
-    w_max = int(min(W//3, est_w * 1.25))
-    if w_max < w_min: w_max = w_min + 1
-    widths = np.linspace(w_min, w_max, num=max(3, search_steps//3)).astype(int)
-
-    # offsets from (W - 5*cw - margin) to W-5*cw
-    best_score = -1e9
-    best_boxes: List[Tuple[int,int]] = []
-
-    # pre-upscale for faster per-cell evaluation
     up = cv2.resize(line, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     UH, UW = up.shape[:2]
 
     def cell_roi(ix0, ix1):
         return up[:, max(0, ix0):min(UW, ix1)]
 
+    est_w = W / 5.0
+    w_min = int(max(9, est_w * 0.70))
+    w_max = int(min(W//3, est_w * 1.35))
+    gaps  = list(range(1, 6))
+
+    best_score = -1e9
+    best_boxes: List[Tuple[int,int]] = []
+
+    widths = np.linspace(w_min, w_max, num=10, dtype=int)
     for cw in widths:
-        total_w = 5 * cw
-        if total_w >= W: 
-            continue
-        # try small margins between cells
-        for gap in (1, 2, 3, 4):
+        for gap in gaps:
             span = 5*cw + 4*gap
-            if span >= W: 
+            if span >= W:
                 continue
-            # right-aligned offsets near right edge
-            for off in range(W - span - 4, W - span + 5):
-                if off < 0 or off + span > W: 
-                    continue
-                # build boxes
+            base = W - span
+            for off in range(max(0, base-10), min(W-span, base+10)+1):
                 xs = []
                 x = off
-                for i in range(5):
+                for _ in range(5):
                     xs.append((x, x+cw))
                     x += cw + gap
-                # evaluate by template IoU sum
+
                 score = 0.0
                 for (a, b) in xs:
-                    # map to upscaled coords
-                    a3 = int(a*3); b3 = int(b*3)
+                    a3, b3 = int(a*3), int(b*3)
                     cell = cell_roi(a3, b3)
-                    templ_d, templ_s = _classify_template(cell)
-                    score += templ_s
+                    d, s = _classify_template(cell)
+                    score += s
                 if score > best_score:
-                    best_score = score
-                    best_boxes = xs[:]
+                    best_score, best_boxes = score, xs[:]
 
-    # safety fallback: equal split
     if not best_boxes:
         margin = max(1, int(0.01 * W))
         cw = (W - 4*margin) // 5
@@ -262,11 +266,11 @@ def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
     UH, UW = up.shape[:2]
     out = []
 
-    for (a, b) in boxes:
+    for idx, (a, b) in enumerate(boxes):
         a3 = max(0, int(a*3)); b3 = min(UW, int(b*3))
         cell = up[:, a3:b3]
 
-        # tight vertical crop
+        # tighten vertically
         m = (_bin_pair(cell)[0] > 0) | (_bin_pair(cell)[1] > 0)
         hp = m.mean(axis=1)
         rows = np.where(hp > max(0.05, hp.mean() + 0.35*hp.std()))[0]
@@ -276,18 +280,42 @@ def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
             y0 = max(0, y0 - pad); y1 = min(m.shape[0]-1, y1 + pad)
             cell = cell[y0:y1+1, :]
 
-        # Tesseract first
-        ch = _tess_char(cell)
-        # Template fallback/verification
+        # Tesseract + Template
+        t_char = _tess_char(cell)
         templ_d, templ_s = _classify_template(cell)
 
-        # Sanity flip to 5 if shape says so
-        if ch:
-            cmask = _digit_mask(cell)
-            if _looks_like_five(cmask) and ch in ("4","2","0"):
+        cmask = _digit_mask(cell)
+
+        # Base decision with 5-shape sanity (now includes '3')
+        if t_char:
+            if _looks_like_five(cmask) and t_char in ("4", "2", "0", "3"):
                 ch = "5"
+            else:
+                ch = t_char
         else:
-            ch = templ_d
+            if _looks_like_five(cmask) and templ_d in ("4", "2", "0", "3"):
+                ch = "5"
+            else:
+                ch = templ_d
+
+        # ---------- LAST-DIGIT DISAMBIGUATION (3 ↔ 5) ----------
+        if idx == len(boxes) - 1 and ch == "3":
+            # 1) segment-shape check (favor 5)
+            en = _seg_energies(cmask)  # A..G energies
+            A,B,C,D,E,F,G = en["A"],en["B"],en["C"],en["D"],en["E"],en["F"],en["G"]
+            looks5 = (A>0.18 and D>0.18 and G>0.16 and C>0.14 and F>0.10 and B<0.24 and E<0.24)
+
+            # 2) template score comparison (favor 5 if close/better)
+            scores = _template_scores(cell)
+            s5 = scores.get("5", 0.0)
+            s3 = scores.get("3", 0.0)
+
+            # 3) simple right-vs-left edge cue: 5 has left vertical (F) > right-top (B)
+            edge_favors_5 = F > (B + 0.02) and C >= 0.10
+
+            if looks5 or s5 >= 0.92 * s3 or edge_favors_5:
+                ch = "5"
+        # --------------------------------------------------------
 
         out.append(ch if ch else templ_d)
 
@@ -299,8 +327,8 @@ def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
 def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
     """
     LCD → digit-line crop → grid-search best 5-cell split (maximize template IoU) →
-    per-cell OCR (Tesseract psm10 + template fallback) → shape sanity for '5' →
-    exactly 5 digits (right-aligned).
+    per-cell OCR (Tesseract psm10 + template fallback) → shape sanity for '5'
+    (+ explicit last-digit 3→5 fix) → exactly 5 digits (right-aligned).
     """
     bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
@@ -310,7 +338,7 @@ def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
     gray = cv2.cvtColor(lcd, cv2.COLOR_BGR2GRAY)
     line = _crop_digit_line(gray)
 
-    boxes = _best_grid(line, search_steps=12)
+    boxes = _best_grid(line)
     digits = _ocr_cells(line, boxes)
 
     digits = re.sub(r"\D+", "", digits or "")
@@ -320,6 +348,6 @@ def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
         "tesseract_used": _USE_TESS,
         "lcd_size": list(gray.shape),
         "ok": bool(digits),
-        "method": "grid-search IoU → per-cell tesseract+template (5 sanity)"
+        "method": "grid-search IoU → per-cell tesseract+template (5 sanity, last 3→5)",
     }
     return digits, debug
