@@ -4,18 +4,18 @@ from typing import Tuple, Dict, List
 import numpy as np
 import cv2
 
-# ---------------- Tesseract (optional) ----------------
+# --------- Optional Tesseract ----------
 _USE_TESS = False
 try:
     import pytesseract
     # If needed on Windows:
-    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\\tesseract.exe"
+    # pytesseract.pytesseract.tesseract_cmd = r"C:\\Program Files\\Tesseract-OCR\\tesseract.exe"
     _USE_TESS = True
 except Exception:
     _USE_TESS = False
 
 
-# ================= Common image helpers =================
+# ============ helpers ============
 
 def _enhance(gray: np.ndarray, fx: float = 4.5) -> np.ndarray:
     g = cv2.resize(gray, None, fx=fx, fy=fx, interpolation=cv2.INTER_CUBIC)
@@ -38,7 +38,7 @@ def _smooth_1d(x: np.ndarray, k: int = 9) -> np.ndarray:
     return np.convolve(x, ker, mode="same")
 
 
-# ================= Step 1: LCD crop =================
+# ============ LCD crop ============
 
 def _find_lcd_bgr(bgr: np.ndarray) -> np.ndarray:
     h, w = bgr.shape[:2]
@@ -54,14 +54,16 @@ def _find_lcd_bgr(bgr: np.ndarray) -> np.ndarray:
         x, y, ww, hh = max((cv2.boundingRect(c) for c in cnts), key=lambda r: r[2]*r[3])
         lcd = bgr[y:y+hh, x:x+ww]
     else:
+        # fallback window
         lcd = bgr[int(0.10*h):int(0.35*h), int(0.18*w):int(0.82*w)]
 
+    # crop the lower band where digits live (still wide)
     H, W = lcd.shape[:2]
     band = lcd[int(0.24*H):int(0.98*H), int(0.06*W):int(0.94*W)]
     return band if band.size else lcd
 
 
-# ================= Step 2: crop exact digit line =================
+# ============ Digit line crop ============
 
 def _crop_digit_line(gray_lcd: np.ndarray) -> np.ndarray:
     g = _enhance(gray_lcd, fx=4.0)
@@ -93,10 +95,64 @@ def _crop_digit_line(gray_lcd: np.ndarray) -> np.ndarray:
     return g
 
 
-# ================= Step 3: seven-seg regions & templates =================
+# ============ WHOLE-LINE / WHOLE-LCD DECIMAL OCR (new) ============
+
+def _ocr_line_decimal(img_gray: np.ndarray) -> str:
+    """
+    Try to read a decimal value like '04.820' from a grayscale LCD/digit-line image.
+    Returns '' if not confidently found.
+    """
+    if not _USE_TESS:
+        return ""
+
+    g0 = cv2.resize(img_gray, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
+    g0 = cv2.bilateralFilter(g0, 5, 50, 50)
+    g0 = cv2.equalizeHist(g0)
+
+    v_raw = g0
+    v_bin = []
+    v_bin.append(cv2.threshold(g0, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1])
+    v_bin.append(cv2.adaptiveThreshold(g0, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                       cv2.THRESH_BINARY_INV, 31, 7))
+    variants = [v_raw] + v_bin + [cv2.bitwise_not(v) for v in v_bin]
+
+    cfgs = [
+        "--oem 1 --psm 7  -c tessedit_char_whitelist=0123456789.",
+        "--oem 1 --psm 6  -c tessedit_char_whitelist=0123456789.",
+        "--oem 1 --psm 11 -c tessedit_char_whitelist=0123456789.",
+        "--oem 1 --psm 13 -c tessedit_char_whitelist=0123456789.",
+    ]
+
+    strict = re.compile(r"\b\d{1,3}[.]\d{2,3}\b")
+    loose  = re.compile(r"\d+[.,]\d+")
+
+    best = ""
+    for img in variants:
+        for cfg in cfgs:
+            try:
+                txt = pytesseract.image_to_string(img, config=cfg)
+            except Exception:
+                continue
+            if not txt:
+                continue
+            t = txt.strip().replace(" ", "")
+            t = t.replace("O", "0").replace("o", "0").replace(",", ".").replace("·", ".")
+            # find decimal anywhere in the text
+            m = strict.findall(t)
+            if m:
+                cand = max(m, key=len)
+                if cand.replace(".", "") != "00000":
+                    return cand
+            if not best:
+                m2 = loose.findall(t)
+                if m2:
+                    best = m2[0].replace(",", ".")
+    return best
+
+
+# ============ Seven-seg scoring (for 5-digit path) ============
 
 def _seg_regions(h: int, w: int):
-    # Narrow B/E (noise), generous C/F (weak strokes)
     A = (slice(int(0.10*h), int(0.25*h)), slice(int(0.25*w), int(0.75*w)))
     B = (slice(int(0.28*h), int(0.56*h)), slice(int(0.78*w), int(0.95*w)))
     C = (slice(int(0.62*h), int(0.90*h)), slice(int(0.70*w), int(0.95*w)))
@@ -151,24 +207,11 @@ def _classify_template(cell_gray: np.ndarray) -> (str, float):
     for d, ideal in IDEALS.items():
         templ = _mask_from_ideal(h, w, ideal)
         s = _iou_weighted(cell_mask, templ, ideal)
-        if d == "5":  # small bias
+        if d == "5":
             s *= 1.12
         if s > best_s:
             best_s, best_d = s, d
     return best_d or "0", float(best_s)
-
-def _template_scores(cell_gray: np.ndarray) -> Dict[str, float]:
-    """Return weighted IoU scores for all digits 0–9 (same scoring as _classify_template)."""
-    cell_mask = _digit_mask(cell_gray)
-    h, w = cell_mask.shape
-    scores: Dict[str, float] = {}
-    for d, ideal in IDEALS.items():
-        templ = _mask_from_ideal(h, w, ideal)
-        s = _iou_weighted(cell_mask, templ, ideal)
-        if d == "5":
-            s *= 1.12  # keep same 5-bias
-        scores[d] = float(s)
-    return scores
 
 def _looks_like_five(mask: np.ndarray) -> bool:
     h, w = mask.shape
@@ -177,20 +220,27 @@ def _looks_like_five(mask: np.ndarray) -> bool:
     return (A>0.20 and D>0.20 and G>0.20 and C>0.17 and F>0.15 and B<0.18 and E<0.18)
 
 def _seg_energies(mask: np.ndarray) -> Dict[str, float]:
-    """Return per-segment on-ratios (A..G)."""
     h, w = mask.shape
     segs = _seg_regions(h, w)
     vals = [mask[ys, xs].mean() for (ys, xs) in segs]
     return dict(zip(["A","B","C","D","E","F","G"], vals))
 
+def _template_scores(cell_gray: np.ndarray) -> Dict[str, float]:
+    cell_mask = _digit_mask(cell_gray)
+    h, w = cell_mask.shape
+    scores: Dict[str, float] = {}
+    for d, ideal in IDEALS.items():
+        templ = _mask_from_ideal(h, w, ideal)
+        s = _iou_weighted(cell_mask, templ, ideal)
+        if d == "5":
+            s *= 1.12
+        scores[d] = float(s)
+    return scores
 
-# ================= Step 4: grid search for best 5-cell split =================
+
+# ============ 5-digit grid search path (kept for sample #1) ============
 
 def _best_grid(line: np.ndarray) -> List[Tuple[int,int]]:
-    """
-    Try many right-aligned 5-cell grids (width/gap/offset) and keep the one
-    with the highest total template score.
-    """
     H, W = line.shape[:2]
     up = cv2.resize(line, None, fx=3.0, fy=3.0, interpolation=cv2.INTER_CUBIC)
     UH, UW = up.shape[:2]
@@ -237,8 +287,6 @@ def _best_grid(line: np.ndarray) -> List[Tuple[int,int]]:
     return best_boxes
 
 
-# ================= Step 5: per-cell OCR (Tesseract + template) =================
-
 _CELL_CFGS = [
     "--oem 1 --psm 10 -c tessedit_char_whitelist=0123456789",
     "--oem 1 --psm 13 -c tessedit_char_whitelist=0123456789",
@@ -282,11 +330,9 @@ def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
 
         # Tesseract + Template
         t_char = _tess_char(cell)
-        templ_d, templ_s = _classify_template(cell)
-
+        templ_d, _ = _classify_template(cell)
         cmask = _digit_mask(cell)
 
-        # Base decision with 5-shape sanity (now includes '3')
         if t_char:
             if _looks_like_five(cmask) and t_char in ("4", "2", "0", "3"):
                 ch = "5"
@@ -298,46 +344,51 @@ def _ocr_cells(line: np.ndarray, boxes: List[Tuple[int,int]]) -> str:
             else:
                 ch = templ_d
 
-        # ---------- LAST-DIGIT DISAMBIGUATION (3 ↔ 5) ----------
+        # last-digit disambig 3→5 (score + segments)
         if idx == len(boxes) - 1 and ch == "3":
-            # 1) segment-shape check (favor 5)
-            en = _seg_energies(cmask)  # A..G energies
+            en = _seg_energies(cmask)
             A,B,C,D,E,F,G = en["A"],en["B"],en["C"],en["D"],en["E"],en["F"],en["G"]
             looks5 = (A>0.18 and D>0.18 and G>0.16 and C>0.14 and F>0.10 and B<0.24 and E<0.24)
-
-            # 2) template score comparison (favor 5 if close/better)
-            scores = _template_scores(cell)
-            s5 = scores.get("5", 0.0)
-            s3 = scores.get("3", 0.0)
-
-            # 3) simple right-vs-left edge cue: 5 has left vertical (F) > right-top (B)
-            edge_favors_5 = F > (B + 0.02) and C >= 0.10
-
-            if looks5 or s5 >= 0.92 * s3 or edge_favors_5:
+            sc = _template_scores(cell); s5, s3 = sc.get("5",0.0), sc.get("3",0.0)
+            edge = F > (B + 0.02) and C >= 0.10
+            if looks5 or s5 >= 0.92*s3 or edge:
                 ch = "5"
-        # --------------------------------------------------------
 
         out.append(ch if ch else templ_d)
-
     return "".join(out)
 
 
-# ================= Public API =================
+# ============ Public API ============
 
 def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
     """
-    LCD → digit-line crop → grid-search best 5-cell split (maximize template IoU) →
-    per-cell OCR (Tesseract psm10 + template fallback) → shape sanity for '5'
-    (+ explicit last-digit 3→5 fix) → exactly 5 digits (right-aligned).
+    1) Crop LCD + digit-line.
+    2) Try DECIMAL OCR first (digit-line, then whole LCD); if found, return it (e.g., '04.820').
+    3) Else: robust 5-digit per-cell pipeline (kept for sample #1).
     """
     bgr = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
     if bgr is None:
         return "", {"error": "invalid-image"}
 
-    lcd = _find_lcd_bgr(bgr)
-    gray = cv2.cvtColor(lcd, cv2.COLOR_BGR2GRAY)
-    line = _crop_digit_line(gray)
+    lcd_bgr = _find_lcd_bgr(bgr)
+    gray_lcd = cv2.cvtColor(lcd_bgr, cv2.COLOR_BGR2GRAY)
+    line = _crop_digit_line(gray_lcd)
 
+    # ---- DECIMAL FIRST (new) ----
+    dec = _ocr_line_decimal(line)
+    if not dec:
+        dec = _ocr_line_decimal(gray_lcd)  # also try entire LCD
+    if dec:
+        debug = {
+            "tesseract_used": _USE_TESS,
+            "lcd_size": list(gray_lcd.shape),
+            "ok": True,
+            "method": "decimal whole-line tesseract",
+        }
+        return dec, debug
+    # -----------------------------
+
+    # 5-digit fallback (unchanged behavior for sample #1)
     boxes = _best_grid(line)
     digits = _ocr_cells(line, boxes)
 
@@ -346,7 +397,7 @@ def read_meter(image_bytes: bytes) -> Tuple[str, Dict]:
 
     debug = {
         "tesseract_used": _USE_TESS,
-        "lcd_size": list(gray.shape),
+        "lcd_size": list(gray_lcd.shape),
         "ok": bool(digits),
         "method": "grid-search IoU → per-cell tesseract+template (5 sanity, last 3→5)",
     }
