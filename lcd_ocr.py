@@ -6,7 +6,7 @@ from typing import Optional, Tuple, List
 
 # ===================== Tesseract path =====================
 def _setup_tesseract_path() -> Optional[str]:
-    fixed = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    fixed = r"C:\Tesseract\tesseract.exe"
     for p in [fixed, os.environ.get("TESSERACT_CMD"), shutil.which("tesseract")]:
         if p and os.path.isfile(p):
             pytesseract.pytesseract.tesseract_cmd = p
@@ -129,7 +129,7 @@ def binarize_lcd(crop: np.ndarray, scale: float = 6.0, boost_contrast: bool=Fals
     th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8), 1)
     return 255 - th  # black digits on white
 
-# ===================== Slotting (estimate digit boxes) =====================
+# ===================== Slotting =====================
 def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[int,int], np.ndarray]:
     inv = 255 - bw
     rows = inv.sum(axis=1).astype(np.float32)
@@ -161,7 +161,7 @@ def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[in
 
     widths = [e-s+1 for s,e in spans]
     medw = max(1.0, float(np.median(widths)))
-    spans = [(s,e) for (s,e) in spans if (e-s+1) > 0.25*medw]  # keep skinny '1'
+    spans = [(s,e) for (s,e) in spans if (e-s+1) > 0.25*medw]
 
     def multi_split(s, e):
         parts = [(s, e)]
@@ -203,7 +203,6 @@ def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[in
     spans = sorted(improved)
     return spans, (y0,y1), proj
 
-# ===================== Force-split to target slot count =====================
 def _force_split_to(spans: List[tuple], proj: np.ndarray, medw: float, target: int) -> List[tuple]:
     spans = sorted(spans)
 
@@ -261,8 +260,8 @@ def detect_decimal_points_anywhere(bw: np.ndarray,
                                    yband: Tuple[int,int]) -> List[int]:
     if not spans: return []
     y0, y1 = yband; H = y1 - y0 + 1
-    band = bw[y0:y1+1, :]          # black digits on white
-    ink  = 255 - band               # white strokes on black
+    band = bw[y0:y1+1, :]
+    ink  = 255 - band
 
     widths = [e - s + 1 for (s, e) in spans]
     Wmed = float(np.median(widths)) if widths else band.shape[1]
@@ -305,9 +304,9 @@ def detect_decimal_points_anywhere(bw: np.ndarray,
     return sorted(best_by_k.keys())
 
 # ===================== Tesseract helpers =====================
-def tess_digits_dot(bin_img: np.ndarray, psm: int = 7) -> str:
+def tess_digits_dot(img: np.ndarray, psm: int = 7) -> str:
     cfg = f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789."
-    return pytesseract.image_to_string(bin_img, config=cfg)
+    return pytesseract.image_to_string(img, config=cfg)
 
 # ===== 7-seg classifier utilities =====
 SEG_MAP = {
@@ -324,91 +323,153 @@ SEG_MAP = {
 }
 
 def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
-    H,W = 60,40
-    r = cv2.resize(255 - roi_bw, (W,H), interpolation=cv2.INTER_AREA)  # white strokes on black
-    t_h = int(H*0.15); t_w = int(W*0.18)
-    A = r[0:t_h, int(W*0.2):int(W*0.8)]
-    D = r[H-t_h:H, int(W*0.2):int(W*0.8)]
-    G = r[int(H*0.45):int(H*0.55), int(W*0.2):int(W*0.8)]
-    F = r[int(H*0.15):int(H*0.5), 0:t_w]
-    B = r[int(H*0.15):int(H*0.5), W-t_w:W]
-    E = r[int(H*0.5):int(H*0.85), 0:t_w]
-    C = r[int(H*0.5):int(H*0.85), W-t_w:W]
-    regs=[A,B,C,D,E,F,G]
-    white=[(rg>200).mean() for rg in regs]
-    mean_w, max_w = float(np.mean(white)), float(np.max(white))
-    spread = max_w - mean_w
-    if spread < 0.18 and max_w < 0.65:
+    """
+    Soft/asymmetric 7-seg classifier with HARD exclusions:
+    - If G (middle) is clearly ON, forbid {0,1,7}.
+    - If D (bottom) is ON, penalize/forbid digits that don't have D (1,4,7).
+    - Strong targeted pushes toward 2 and 5 using E/F/C/B patterns.
+    Returns (digit, confidence 0..1).
+    """
+    H, W = 60, 40
+    r = cv2.resize(255 - roi_bw, (W, H), interpolation=cv2.INTER_AREA).astype(np.uint8)
+
+    # Segment ROIs
+    t_h = int(H * 0.16)
+    v_w = int(W * 0.18)
+    A = r[0:t_h,               int(W*0.20):int(W*0.80)]
+    D = r[H-t_h:H,             int(W*0.20):int(W*0.80)]
+    G = r[int(H*0.45):int(H*0.55), int(W*0.20):int(W*0.80)]
+    F = r[int(H*0.16):int(H*0.50), 0:v_w]
+    B = r[int(H*0.16):int(H*0.50), W-v_w:W]
+    E = r[int(H*0.50):int(H*0.84), 0:v_w]
+    C = r[int(H*0.50):int(H*0.84), W-v_w:W]
+    regs = [A, B, C, D, E, F, G]
+
+    # Per-region "on-ness" via Otsu
+    m = []
+    for rg in regs:
+        thr = cv2.threshold(rg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        m.append((thr > 0).mean())
+    m = np.array(m, dtype=np.float32)
+    mA, mB, mC, mD, mE, mF, mG = m
+
+    # Global ink guard
+    global_strength = float((r > 180).mean())
+    if global_strength < 0.015:
         return "?", 0.0
-    on=[1 if (wf>(mean_w+0.10) and wf>0.35) else 0 for wf in white]
-    key=tuple(on)
-    if key==(1,1,1,1,1,1,1):
-        conf=min(white)
-        return ("8" if conf>=0.55 else "?"), (conf if conf>=0.55 else 0.0)
-    if key in SEG_MAP:
-        conf=float(sum(on))/7.0
-        return SEG_MAP[key], conf
-    if white[6] < 0.65*max(white[0],white[3]): return "0", 0.45
-    if white[2] > white[4] + 0.15: return "9", 0.40
-    if sum(on)>=5: return "5", 0.35
-    return "?", 0.0
 
-def _split_cols(bw: np.ndarray, expected_digits: Optional[int] = None) -> List[Tuple[int,int]]:
-    inv = 255 - bw
-    proj = cv2.blur(inv, (11,1)).sum(axis=0)
-    m = proj.max()
-    if m <= 1e-6: return []
-    mask = (proj > 0.12*m).astype(np.uint8)
-    spans = []; in_run=False; st=0
-    for i,v in enumerate(mask):
-        if v and not in_run: in_run=True; st=i
-        elif not v and in_run: in_run=False; spans.append((st,i-1))
-    if in_run: spans.append((st,len(mask)-1))
-    merged=[]
-    for s,e in spans:
-        if not merged or s-merged[-1][1] > 3: merged.append((s,e))
-        else: merged[-1]=(merged[-1][0],e)
-    spans = merged
-    if not spans: return []
-    widths = [e-s+1 for s,e in spans]; med = np.median(widths)
-    spans = [(s,e) for (s,e) in spans if (e-s+1) > 0.35*med]
-    if not spans: return []
-    if expected_digits is None: return spans
-    def split_span(s,e):
-        if e-s < int(1.3*med): return [(s,e)]
-        sub = proj[s:e+1]; mid = (len(sub)//2)
-        w = max(3, (e-s)//6); lo = max(0, mid-w); hi = min(len(sub)-1, mid+w)
-        cut = int(np.argmin(sub[lo:hi+1])) + lo
-        if cut <= 1 or cut >= len(sub)-2: return [(s,e)]
-        return [(s, s+cut-1), (s+cut, e)]
-    spans = sorted(spans)
-    while len(spans) > expected_digits:
-        gaps = [(spans[i+1][0]-spans[i][1], i) for i in range(len(spans)-1)]
-        _, i = min(gaps, key=lambda t: t[0]); s1,e1 = spans[i]; s2,e2 = spans[i+1]
-        spans[i:i+2] = [(s1, e2)]
-    while len(spans) < expected_digits:
-        idx = int(np.argmax([e-s for (s,e) in spans])); s,e = spans[idx]
-        parts = split_span(s,e)
-        if len(parts)==1:
+    # Ideal patterns
+    patterns = {
+        "0": np.array([1,1,1,1,1,1,0], dtype=np.float32),
+        "1": np.array([0,1,1,0,0,0,0], dtype=np.float32),
+        "2": np.array([1,1,0,1,1,0,1], dtype=np.float32),
+        "3": np.array([1,1,1,1,0,0,1], dtype=np.float32),
+        "4": np.array([0,1,1,0,0,1,1], dtype=np.float32),
+        "5": np.array([1,0,1,1,0,1,1], dtype=np.float32),
+        "6": np.array([1,0,1,1,1,1,1], dtype=np.float32),
+        "7": np.array([1,1,1,0,0,0,0], dtype=np.float32),
+        "8": np.array([1,1,1,1,1,1,1], dtype=np.float32),
+        "9": np.array([1,1,1,1,0,1,1], dtype=np.float32),
+    }
+
+    # Weights (G emphasized)
+    w = np.array([0.95, 1.10, 1.10, 1.00, 1.10, 1.10, 1.75], dtype=np.float32)
+
+    # Base scores
+    scores = {}
+    for d, pat in patterns.items():
+        on_term  = pat * m
+        off_term = (1.0 - pat) * (1.0 - m)
+        scores[d] = float(np.dot(w, on_term + off_term))
+
+    # Helpful cues
+    left_heavy   = max(0.0, mF - mC)      # F > C
+    right_heavy  = max(0.0, mC - mF)      # C > F
+    top_on, mid_on, bot_on = mA, mG, mD
+
+    # ==== HARD constraints / priors ====
+    # If middle bar is ON, digits without G (0/1/7) are invalid.
+    if mid_on >= 0.36:
+        for d in ("0", "1", "7"):
+            scores[d] = -1e6  # forbid
+
+    # If bottom bar is ON, 4/1/7 don't have D -> strongly penalize / forbid
+    if bot_on >= 0.30:
+        scores["4"] = min(scores.get("4", -1e6), -1e6/2)
+        scores["1"] = min(scores.get("1", -1e6), -1e6/2)
+        scores["7"] = min(scores.get("7", -1e6), -1e6/2)
+
+    # If middle is very OFF, penalize G-on digits (2,3,4,5,6,8,9)
+    if mid_on <= 0.12:
+        for d in ("2","3","4","5","6","8","9"):
+            scores[d] -= 0.55 * (0.12 - mid_on)
+
+    # ==== Targeted pushes (makes 2 and 5 win when pattern fits) ====
+    # 2 wants: A,D,G,E on; F/C off-ish; B moderate/right upper present
+    scores["2"] += 0.28*top_on + 0.40*bot_on + 0.65*mid_on \
+                   + 0.55*max(0.0, mE - 0.28) - 0.35*mF - 0.25*mC + 0.10*max(0.0, mB - 0.18) \
+                   + 0.08*right_heavy
+
+    # 5 wants: A,D,G,F,C on; B/E off-ish
+    scores["5"] += 0.28*top_on + 0.40*bot_on + 0.65*mid_on \
+                   + 0.45*max(0.0, mF - 0.22) + 0.35*max(0.0, mC - 0.22) \
+                   - 0.30*mB - 0.25*mE + 0.08*left_heavy
+
+    # 4: prefers G + F + B, A/D off (already discouraged by bottom-on rule if bot_on high)
+    scores["4"] += 0.30*mid_on + 0.18*mF + 0.18*mB + 0.25*(1.0 - top_on) - 0.15*bot_on
+
+    # 9: E off, F on, G on
+    scores["9"] += 0.20*mid_on + 0.15*mF + 0.15*(1.0 - mE) + 0.10*right_heavy
+
+    # Prefer 7 only if top is strong and middle is weak (rare in meters)
+    if not (top_on > 0.26 and mid_on < 0.20):
+        scores["7"] -= 0.30
+
+    # Choose best NON-forbidden digit
+    items = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    best_d, best_s = items[0]
+    # If the best is forbidden (score < -1e5), pick the first non-forbidden
+    for d, s in items:
+        if s > -1e5:
+            best_d, best_s = d, s
             break
-        spans[idx:idx+1] = parts
-    return spans
+    second_s = next((s for _, s in items if s < best_s + 1e-12 and s != best_s), best_s - 1e-6)
 
-def sevenseg_read(bw: np.ndarray, expected_digits: Optional[int] = None) -> Tuple[str, float]:
-    b = bw if bw.mean() < 128 else 255 - bw
-    spans = _split_cols(b, expected_digits=expected_digits)
-    if not spans: return "", 0.0
-    rows = (255 - b).sum(axis=1)
-    band = np.where(rows > 0.10*rows.max())[0]
-    y0,y1 = (int(band.min()), int(band.max())) if band.size else (0, b.shape[0]-1)
-    tight = b[y0:y1+1, :]
-    out=[]; confs=[]
-    for sx,ex in spans:
-        roi = tight[:, sx:ex+1]
-        roi = cv2.copyMakeBorder(roi,2,2,2,2, cv2.BORDER_CONSTANT, value=255)
-        d,c = _classify_7seg_roi(roi)
-        if d!="?": out.append(d); confs.append(c)
-    return "".join(out), (float(np.mean(confs)) if confs else 0.0)
+    # Confidence from margin × global strength
+    margin = (best_s - second_s) / max(1e-6, abs(best_s))
+    conf = max(0.0, min(1.0, 0.65 * margin + 0.35 * global_strength))
+
+    # Sanity: if predicted 1 but clear top bar, likely 7 (kept for completeness)
+    if best_d == "1" and top_on > 0.28 and mB > 0.15:
+        best_d = "7"
+
+    return best_d, conf
+
+# Ensemble voting across many binarized variants for a slot
+def _sevenseg_vote_from_rois(rois: List[np.ndarray]) -> Tuple[str, float]:
+    """
+    Ensemble vote of 7-seg classifications across multiple binarized ROI variants.
+    Returns (digit, confidence). If no consensus, returns ("?", 0.0).
+    """
+    if not rois:
+        return ("?", 0.0)
+    votes: dict[str, int] = {}
+    confs_by_digit: dict[str, list[float]] = {}
+    for r in rois:
+        d, c = _classify_7seg_roi(r)
+        if d == "?":
+            continue
+        votes[d] = votes.get(d, 0) + 1
+        confs_by_digit.setdefault(d, []).append(c)
+    if not votes:
+        return ("?", 0.0)
+    best_digit = max(votes.items(), key=lambda kv: (kv[1], np.mean(confs_by_digit.get(kv[0], [0.0]))))[0]
+    total = len(rois)
+    vote_count = votes[best_digit]
+    avg_conf = float(np.mean(confs_by_digit.get(best_digit, [0.0])))
+    if vote_count >= max(2, total // 3):
+        return best_digit, max(0.30, avg_conf)
+    return ("?", 0.0)
 
 # ===================== Autoscale =====================
 def autoscale_until_legible(crop_bgr: np.ndarray,
@@ -449,34 +510,37 @@ def _tess_one_char(img_bw: np.ndarray) -> str:
     vals, counts = np.unique(cands, return_counts=True)
     return str(vals[np.argmax(counts)])
 
+def _local_norm_for_slot(roi: np.ndarray) -> np.ndarray:
+    clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(4,4))
+    x = clahe.apply(roi)
+    return cv2.normalize(x, None, 0, 255, cv2.NORM_MINMAX)
+
 def _best_7seg_over_variants(roi_bw: np.ndarray) -> Tuple[str, float]:
-    """
-    Try small rotations and heavier morphology to rescue faint digits.
-    roi_bw is black-on-white.
-    """
-    base = roi_bw.copy()
+    base = _local_norm_for_slot(roi_bw)
 
     def rot(img, deg):
         h, w = img.shape[:2]
         M = cv2.getRotationMatrix2D((w/2, h/2), deg, 1.0)
         return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
-    variants = []
-    # original + slight rotations (wider sweep)
-    variants.append(base)
-    for d in (-4, -3, -2, -1, 1, 2, 3, 4):
+    variants = [base]
+    for d in (-5, -4, -3, -2, -1, 1, 2, 3, 4, 5):
         variants.append(rot(base, d))
-    # heavier morphology on original + small rotations
     for d in (0, -2, 2):
         img = rot(base, d) if d != 0 else base
         inv = 255 - img
-        th = (inv < 240).astype(np.uint8) * 255  # derive from ink
+        th = (inv < 240).astype(np.uint8) * 255
         th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
         th = cv2.dilate(th, np.ones((5,5), np.uint8), 1)
         th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
         th = cv2.dilate(th, np.ones((7,7), np.uint8), 1)
+        th = cv2.dilate(th, np.ones((9,9), np.uint8), 1)
         th = 255 - th
         variants.append(th)
+
+    voted_d, voted_c = _sevenseg_vote_from_rois(variants)
+    if voted_d != "?":
+        return voted_d, voted_c
 
     best = ("?", 0.0)
     for v in variants:
@@ -491,58 +555,83 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
     y0, y1 = yband
     tight = bw[y0:y1+1, :]  # black digits on white
 
+    # Trim a little from top/bottom to remove glare without killing segments
+    H = tight.shape[0]
+    trim = max(1, int(0.04 * H))
+    tight = tight[trim:H-trim, :]
+
+    widths = [ex - sx + 1 for (sx,ex) in spans]
+    medw = float(np.median(widths)) if widths else 1.0
+
     out = []
     for idx, (sx, ex) in enumerate(spans, start=1):
-        # Expand horizontally to keep faint edge segments
+        # Wider horizontal pad + some vertical pad
         w = ex - sx + 1
-        pad = max(2, w // 6)  # a bit wider than before
-        a = max(0, sx - pad); b = min(tight.shape[1] - 1, ex + pad)
-        roi = tight[:, a:b+1]
+        h = tight.shape[0]
+        pad_x = max(3, int(0.33 * w))
+        pad_y = max(2, int(0.10 * h))
 
-        # Upscale
-        Ht = 240
+        a = max(0, sx - pad_x)
+        b = min(tight.shape[1] - 1, ex + pad_x)
+        roi_full = tight[:, a:b+1]
+        roi = cv2.copyMakeBorder(roi_full, pad_y, pad_y, 0, 0, cv2.BORDER_REPLICATE)
+
+        # --- horizontal jitter voting (reduce boundary clipping errors) ---
+        jitters = [-3, -2, -1, 0, 1, 2, 3]
+        jitter_votes = {}
+        for j in jitters:
+            if j < 0:
+                roi_j = roi[:, -j: ]  if roi.shape[1]+j > 5 else roi
+            elif j > 0:
+                roi_j = roi[:, : -j ] if roi.shape[1]-j > 5 else roi
+            else:
+                roi_j = roi
+            inv_j = 255 - cv2.GaussianBlur(_local_norm_for_slot(roi_j), (3,3), 0)
+            th_j  = cv2.adaptiveThreshold(inv_j, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY, 31, -9)
+            d_j, c_j = _classify_7seg_roi(255 - th_j)
+            if d_j != "?":
+                jitter_votes[d_j] = jitter_votes.get(d_j, 0) + (1.0 if c_j < 0.5 else 1.5)
+        jitter_digit = None
+        if jitter_votes:
+            jitter_digit = max(jitter_votes.items(), key=lambda kv: kv[1])[0]
+
+        # Upscale + local normalize
+        Ht = 260
         sc = max(1.0, Ht / max(12, roi.shape[0]))
         roi_up = cv2.resize(roi, None, fx=sc, fy=sc, interpolation=cv2.INTER_CUBIC)
+        roi_up = _local_norm_for_slot(roi_up)
 
-        # Build many binarizations (sweep C and dilation)
+        # Build many binarizations (sweep C and dilation) + extra-thick rescue
         rois = []
         inv = 255 - cv2.GaussianBlur(roi_up, (3,3), 0)
         norm = cv2.GaussianBlur(roi_up, (3,3), 0)
-        Cs_inv = [-5, -7, -9, -11, -13, -15]
-        Cs_norm = [5, 7, 9]
-        dil_k = [(3,3), (4,4), (5,5), (6,6)]
+        Cs_inv = [-3, -5, -7, -9, -11, -13, -15, -17]
+        Cs_norm = [3, 5, 7, 9]
+        dil_k = [(3,3), (4,4), (5,5), (6,6), (7,7)]
+        dil_k_rescue = [(9,9), (11,11)]
 
-        # inverted adaptive
-        for C in Cs_inv:
-            th = cv2.adaptiveThreshold(inv, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, 31, C)
-            for kx,ky in dil_k:
-                t = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
-                t = cv2.dilate(t, np.ones((kx,ky), np.uint8), 1)
-                ys, xs = np.where(t > 0)
-                if len(xs) > 0:
-                    x0, x1 = max(0, xs.min()-2), min(t.shape[1]-1, xs.max()+2)
-                    y0c, y1c = max(0, ys.min()-2), min(t.shape[0]-1, ys.max()+2)
-                    t = t[y0c:y1c+1, x0:x1+1]
-                rois.append(255 - t)
+        def _add_variants(src, inv_mode: bool):
+            for C in (Cs_inv if inv_mode else Cs_norm):
+                thtype = cv2.THRESH_BINARY if inv_mode else cv2.THRESH_BINARY_INV
+                th = cv2.adaptiveThreshold(src, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                           thtype, 31, C)
+                for kx, ky in dil_k:
+                    t = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
+                    t = cv2.dilate(t, np.ones((kx,ky), np.uint8), 1)
+                    ys, xs = np.where(t > 0)
+                    if len(xs) > 0:
+                        x0, x1 = max(0, xs.min()-2), min(t.shape[1]-1, xs.max()+2)
+                        y0c, y1c = max(0, ys.min()-2), min(t.shape[0]-1, ys.max()+2)
+                        t = t[y0c:y1c+1, x0:x1+1]
+                    rois.append(255 - t)
 
-        # normal adaptive
-        for C in Cs_norm:
-            th = cv2.adaptiveThreshold(norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, 31, C)
-            for kx,ky in dil_k:
-                t = cv2.morphologyEx(th, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
-                t = cv2.dilate(t, np.ones((kx,ky), np.uint8), 1)
-                ys, xs = np.where(t > 0)
-                if len(xs) > 0:
-                    x0, x1 = max(0, xs.min()-2), min(t.shape[1]-1, xs.max()+2)
-                    y0c, y1c = max(0, ys.min()-2), min(t.shape[0]-1, ys.max()+2)
-                    t = t[y0c:y1c+1, x0:x1+1]
-                rois.append(255 - t)
+        _add_variants(inv, True)   # inverted-adaptive path
+        _add_variants(norm, False) # normal-adaptive path
 
-        # inverted Otsu
+        # Otsu variants (with rescue dilations)
         _, thB = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        for kx,ky in dil_k:
+        for kx, ky in dil_k + dil_k_rescue:
             t = cv2.morphologyEx(thB, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
             t = cv2.dilate(t, np.ones((kx,ky), np.uint8), 1)
             ys, xs = np.where(t > 0)
@@ -552,17 +641,16 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
                 t = t[y0c:y1c+1, x0:x1+1]
             rois.append(255 - t)
 
-        # choose most "inked" ROI for 7seg hint
+        # pick most "inked" ROI for rescue baseline
         if rois:
             fill_scores = [(roi_bw < 240).mean() for roi_bw in rois]
             roi7 = rois[int(np.argmax(fill_scores))]
-            d7, c7 = _classify_7seg_roi(roi7)
         else:
-            d7, c7, roi7 = "?", 0.0, 255 - (inv>127).astype(np.uint8)*255
+            roi7 = 255 - (inv>127).astype(np.uint8)*255
 
-        # Tesseract voting
+        # Tesseract voting per slot
         t_candidates = []
-        for r in rois[:36]:
+        for r in rois[:48]:
             c = _tess_one_char(r)
             if c: t_candidates.append(c)
         if t_candidates:
@@ -571,14 +659,37 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
         else:
             dt = ""
 
-        # fuse per slot; if empty/ambiguous, run rescue variants (lower conf gate)
-        if dt:
+        # Seven-seg ensemble vote over all rois
+        d_vote, c_vote = _sevenseg_vote_from_rois(rois)
+
+        # fuse per slot with priorities:
+        # 1) strong tess one-char
+        # 2) confident 7-seg vote across ROIs
+        # 3) jitter consensus (helps when slot boundary clips a bar)
+        # 4) rotated/morph rescue
+        if dt and len(dt) == 1:
             digit = dt
-        elif d7 != "?":
-            digit = d7
+            if d_vote != "?" and c_vote >= 0.55 and dt != d_vote:
+                digit = d_vote
+            elif jitter_digit and dt != jitter_digit:
+                digit = jitter_digit
+        elif d_vote != "?" and c_vote >= 0.40:
+            digit = d_vote
+        elif jitter_digit:
+            digit = jitter_digit
         else:
             r_digit, r_conf = _best_7seg_over_variants(roi7)
-            digit = r_digit if (r_digit != "?" and r_conf >= 0.25) else "?"
+            digit = r_digit if (r_digit != "?" and r_conf >= 0.22) else "?"
+
+        # final thin-digit heuristic (1 vs 7) if still '?'
+        if digit == "?":
+            h2, w2 = roi7.shape[:2]
+            ar = w2 / max(1.0, h2)
+            if ar < 0.44 or w2 < 0.55*medw:
+                inv2 = 255 - roi7
+                top_band = inv2[0:int(0.18*h2), int(0.2*w2):int(0.8*w2)]
+                top_on = (top_band > 200).mean() > 0.25
+                digit = "7" if top_on else "1"
 
         out.append(digit if (digit.isdigit() or digit=="?") else "?")
 
@@ -586,13 +697,12 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
             os.makedirs(dump_dir, exist_ok=True)
             cv2.imwrite(os.path.join(dump_dir, f"{tag}_slot{idx}.png"), roi7)
 
-    # IMPORTANT: keep placeholders so downstream knows slot count
     return "".join(out)
 
 # ===================== Numeric helpers =====================
 def best_numeric(s: str) -> str:
     if not s: return ""
-    s = re.sub(r'(?<=\d):(?=\d)', '4', s)
+    s = re.sub(r'(?<=\d):(?=\d)', '4', s)  # colon → 4 common confusion
     s = re.sub(r'[^0-9\.]', '', s)
     s = re.sub(r'\.{2,}', '.', s)
     cands = re.findall(r'\d+(?:\.\d+)?', s)
@@ -608,12 +718,10 @@ def insert_dot_at(s: str, k: int) -> str:
     k = max(0, min(k, len(s)))
     return s[:k] + "." + s[k:]
 
-# Fill '?' in a slot string using a longer line-level digit string
 def fill_slots_with_line_hint(slot_str: str, line_digits: str) -> str:
     if not slot_str or not line_digits: return slot_str
     m = len(slot_str); n = len(line_digits)
     if n < m: return slot_str
-    # score window by matches on known positions
     best = None
     for i in range(0, n - m + 1):
         win = line_digits[i:i+m]
@@ -621,12 +729,26 @@ def fill_slots_with_line_hint(slot_str: str, line_digits: str) -> str:
         if (best is None) or (score > best[0]): best = (score, i, win)
     if best is None: return slot_str
     _, i, win = best
-    # fill unknowns from the best window
     out = list(slot_str)
     for k,ch in enumerate(out):
         if ch == "?":
             out[k] = win[k]
     return "".join(out)
+
+# ===================== Line-level hints =====================
+def line_level_hints(bgr_crop: np.ndarray, bw: np.ndarray) -> str:
+    hints = []
+    gray = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(4,4)).apply(gray)
+    gray = cv2.resize(gray, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
+    hints.append(tess_digits_dot(gray, psm=7))
+    sharp = cv2.addWeighted(gray, 1.6, cv2.GaussianBlur(gray, (0,0), 1.0), -0.6, 0)
+    hints.append(tess_digits_dot(sharp, psm=7))
+    hints.append(tess_digits_dot(bw, psm=7))
+    cands = [best_numeric(h) for h in hints if h]
+    if not cands: return ""
+    cands.sort(key=len, reverse=True)
+    return cands[0]
 
 # ===================== Pipeline =====================
 def process(input_path: str,
@@ -692,72 +814,49 @@ def process(input_path: str,
     dot_positions = detect_decimal_points_anywhere(bw, spans, yband)
     total_chars = digit_count + len(dot_positions)
 
-    # 5) OCR candidates
-    tess_raw = tess_digits_dot(bw, psm=7)
-    tess_clean = best_numeric(tess_raw)                  # may be empty
-    tess_digits = re.sub(r'[^0-9]', '', tess_clean)      # digits only for hinting
+    # 5) line-level hints (may be empty on faint screens)
+    tess_raw = line_level_hints(crop, bw)
+    tess_clean = best_numeric(tess_raw)
+    tess_digits = re.sub(r'[^0-9]', '', tess_clean)
 
+    # 6) per-slot OCR
     dump_dir = os.path.join(out_dir, base + "_slots") if dump_slots else None
     slot_ocr = ocr_by_slots(bw, spans, yband, dump_dir=dump_dir, tag=base)
-    slot_digits_only = re.sub(r'[^0-9]', '', slot_ocr)   # for scoring
-    s7_raw, s7_conf = sevenseg_read(bw, expected_digits=digit_count if digit_count>0 else None)
-    s7_clean = best_numeric(s7_raw)
+    slot_digits_only = re.sub(r'[^0-9]', '', slot_ocr)
 
-    # 6) choose best among: slot / tesseract-line / sevenseg (safer)
+    # 7) choose best among: slot / tesseract-line
     cands = []
     if slot_digits_only:
-        score = 0.84 if (len(slot_digits_only) == digit_count) else 0.68
+        score = 0.86 if (len(slot_digits_only) == digit_count) else 0.70
         cands.append(("slot", slot_digits_only, score))
     if tess_clean:
-        cands.append(("tess", tess_clean, 0.62 + 0.02*len(tess_clean)))
-    if s7_clean and (s7_conf >= 0.65):
-        cands.append(("7seg", s7_clean, s7_conf))
-
-    # Global line-level fallback if everything empty
-    if not cands:
-        for psm in (13, 6):
-            raw = pytesseract.image_to_string(bw, config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789.")
-            clean = best_numeric(raw)
-            if clean:
-                tess_digits = re.sub(r'[^0-9]', '', clean)
-                cands.append(("tess-line", clean, 0.60 + 0.02*len(clean)))
-                break
+        cands.append(("tess", tess_clean, 0.66 + 0.02*len(tess_clean)))
 
     if cands:
-        cands.sort(key=lambda x: (len(x[1]), x[2]))  # prefer longer then higher score
+        cands.sort(key=lambda x: (len(x[1]), x[2]))
         final_src, final_best_digits, _ = cands[-1]
     else:
         final_src, final_best_digits = "none", ""
 
-    # Build final text for overlay/output:
-    if slot_ocr and final_src in ("slot",) and len(slot_ocr) >= digit_count:
-        final_text = slot_ocr  # includes '?' placeholders at the right positions
+    # 8) Build final text
+    if slot_ocr and len(slot_ocr) >= digit_count:
+        final_text = slot_ocr
+        if "?" in final_text and tess_digits:
+            final_text = fill_slots_with_line_hint(final_text, tess_digits)
     else:
-        final_text = final_best_digits  # digits only
+        final_text = final_best_digits
 
-    # If we still have '?' in slots, try to fill from any available line-level digits
-    if "?" in final_text and tess_digits:
-        final_text = fill_slots_with_line_hint(final_text, tess_digits)
-
-    # Guard: don't accept trivially short 7-seg guess
-    if final_src == "7seg" and len(final_best_digits) < max(2, digit_count // 2):
-        final_src, final_best_digits = "none", ""
-        final_text = ""
-
-    # 7) insert dot if detected and there is no dot yet
+    # 9) insert dot if detected and no dot yet
     clean_digits_for_dot = re.sub(r'[^0-9]', '', final_text)
     if clean_digits_for_dot.isdigit() and dot_positions:
-        # insert based on digits-only index
         k = dot_positions[0]
-        # rebuild from digits to keep alignment
         final_text = insert_dot_at(clean_digits_for_dot, k)
 
-    # 8) apply --decimals if requested
-    if decimals is not None:
-        if final_text and "." not in final_text and final_text.replace("?","").isdigit():
-            final_text = apply_decimals(final_text.replace("?",""), decimals)
+    # 10) apply --decimals if requested
+    if decimals is not None and final_text and "." not in final_text and final_text.replace("?","").isdigit():
+        final_text = apply_decimals(final_text.replace("?", ""), decimals)
 
-    # 9) annotate text
+    # 11) annotate
     ytxt = 24
     overlay = (final_text if final_text else "(no text detected)")
     for line in overlay.splitlines():
@@ -785,20 +884,20 @@ def process(input_path: str,
             "tesseract_raw": tess_raw,
             "tesseract_clean": best_numeric(tess_raw),
             "slot_ocr": slot_ocr,
-            "seven_segment_raw": s7_raw,
-            "seven_segment_clean": s7_clean,
-            "seven_segment_confidence": s7_conf,
+            "seven_segment_raw": "",
+            "seven_segment_clean": "",
+            "seven_segment_confidence": 0.0,
             "selected_source": final_src
         }
     }
 
 # ===================== CLI =====================
 def main():
-    ap = argparse.ArgumentParser(description="LCD OCR with robust slotting, per-slot param sweep + voting, rescue rotations, line-hint filler, dot detection, 7-seg fallback, autoscale, and force-slots")
+    ap = argparse.ArgumentParser(description="LCD OCR with slotting, jitter voting, 7-seg soft classifier + G-prior, param sweep, dot detection, autoscale, and force-slots")
     ap.add_argument("image", help="Input image path (full photo or pre-cropped LCD)")
     ap.add_argument("--out", help="Output directory (default: alongside input)")
     ap.add_argument("--from-crop", action="store_true", help="Treat input as already-cropped LCD")
-    ap.add_argument("--prefer-7seg", action="store_true", help="Prefer 7-seg result when it matches auto digit count")
+    ap.add_argument("--prefer-7seg", action="store_true", help="(kept for compat; rescue uses 7-seg internally)")
     ap.add_argument("--decimals", type=int, default=None, help="If set, force N digits after the decimal when output has no '.'")
     ap.add_argument("--min-char-height", type=int, default=48, help="Min character height (px) for autoscaler")
     ap.add_argument("--force-slots", type=int, default=None, help="Force at least this many digit slots by splitting wide spans")
