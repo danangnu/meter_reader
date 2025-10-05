@@ -14,6 +14,36 @@ def _setup_tesseract_path() -> Optional[str]:
     return None
 _TESS = _setup_tesseract_path()
 
+# ----- Shape heuristics used for last-mile overrides -----
+def _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
+    """
+    Very loose '4' silhouette for this LCD:
+    - D low/off, E low/off, A low
+    - G present (even faint)
+    - B present
+    - Do not require strong C/F (C can be faint on this device)
+    - Avoid obvious right-dominant "5" (both C & F strong and right >> left)
+    """
+    right_crush = (rs >= ls + 0.24) and (c_sig >= 0.24) and (f_sig >= 0.22)
+    return (
+        d_eff < 0.30 and
+        ls    < 0.32 and
+        a_sig < 0.38 and
+        g_eff >= 0.04 and
+        b_sig >= 0.12 and
+        not right_crush
+    )
+
+def _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
+    """
+    Robust '5' silhouette:
+    - Bottom (D) clearly on
+    - Right side dominates left (esp. C)
+    - G usually present
+    """
+    right_dom = (rs >= ls + 0.12) and (c_sig >= 0.22)
+    return (d_eff >= 0.24) and right_dom and (g_eff >= 0.06)
+
 # ===================== Geometry helpers =====================
 def order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
@@ -100,7 +130,7 @@ def find_lcd_quad_color_first(bgr: np.ndarray) -> Optional[np.ndarray]:
     return best
 
 # ===================== Binarize (glow-resistant) =====================
-def _extra_unsharp(x: np.ndarray, amount: float = 1.4) -> np.ndarray:
+def _extra_unsharp(x: np.ndarray, amount: float = 1.8) -> np.ndarray:
     g = cv2.GaussianBlur(x, (0,0), 1.0)
     return cv2.addWeighted(x, 1.0 + amount, g, -amount, 0)
 
@@ -310,10 +340,6 @@ def tess_digits_dot(img: np.ndarray, psm: int = 7) -> str:
 
 # ===== 7-seg intensity helper =====
 def _measure_segments_intensity(roi_bw: np.ndarray) -> Tuple[float,float,float,float,float,float,float]:
-    """
-    Robust per-segment intensity using 85th percentile brightness (white ink on black),
-    z-normalized across segments, then squashed to [0..1]. Handles thin/faint segments.
-    """
     H, W = 60, 40
     r = cv2.resize(255 - roi_bw, (W, H), interpolation=cv2.INTER_AREA).astype(np.float32)
     r = cv2.GaussianBlur(r, (3,3), 0)
@@ -339,9 +365,7 @@ def _measure_segments_intensity(roi_bw: np.ndarray) -> Tuple[float,float,float,f
 # ===== 7-seg classifier (FUSED) =====
 def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     """
-    7-seg classifier (fused evidence + stronger G/D/A/E priors).
-    - Fuse m = 0.35*binary_area + 0.65*percentile_intensity
-    - Add heavy penalties to '4' when A or D or E are on
+    7-seg classifier (fused evidence + priors) with robust + loose '4' silhouette overrides.
     """
     H, W = 60, 40
     r_u8 = cv2.resize(255 - roi_bw, (W, H), interpolation=cv2.INTER_AREA).astype(np.uint8)
@@ -356,14 +380,17 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     C = r_u8[int(H*0.50):int(H*0.84), W-v_w:W]
     regs = [A,B,C,D,E,F,G]
 
+    # binary presence
     m_bin = []
     for rg in regs:
         thr = cv2.threshold(rg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         m_bin.append((thr > 0).mean())
     m_bin = np.array(m_bin, dtype=np.float32)
 
+    # percentile intensities
     mA_i,mB_i,mC_i,mD_i,mE_i,mF_i,mG_i = _measure_segments_intensity(roi_bw)
 
+    # fused presence
     m = 0.35*m_bin + 0.65*np.array([mA_i,mB_i,mC_i,mD_i,mE_i,mF_i,mG_i], dtype=np.float32)
     mA,mB,mC,mD,mE,mF,mG = [float(x) for x in m]
 
@@ -383,14 +410,12 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
         "8": np.array([1,1,1,1,1,1,1], dtype=np.float32),
         "9": np.array([1,1,1,1,0,1,1], dtype=np.float32),
     }
-
-    # heavier G weight
     w = np.array([0.95, 1.10, 1.10, 1.00, 1.10, 1.10, 2.10], dtype=np.float32)
 
     mm = np.array([mA,mB,mC,mD,mE,mF,mG], dtype=np.float32)
     scores = {d: float(np.dot(w, pat*mm + (1.0-pat)*(1.0-mm))) for d,pat in patterns.items()}
 
-    # Continuity for thin bars
+    # continuity (must come before silhouette usage)
     def continuity(band: np.ndarray, thr: int = 200) -> float:
         col_has = (band > thr).any(axis=0)
         return float(col_has.mean())
@@ -402,16 +427,19 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     bot_on_eff = max(mD, 0.85*contD)
     top_on = mA
 
-    # Middle on -> push away from 0/1/7
+    # Gates: if G is on, 0/1/7 are unlikely; if D is on, 4/1/7 are unlikely
     if mid_on_eff >= 0.18:
         for d in ("0","1","7"):
             scores[d] -= 1.4 * (mid_on_eff - 0.18)
-
-    # Bottom on -> 4/1/7 don't have D
     if bot_on_eff >= 0.18:
         scores["4"] -= 1.2 * (bot_on_eff - 0.18)
         scores["1"] -= 1.0 * (bot_on_eff - 0.18)
         scores["7"] -= 0.9 * (bot_on_eff - 0.18)
+
+    # Strongly penalize '5' when bottom bar is weak/off and left-lower (E) is off-ish.
+    if bot_on_eff < 0.24 and mE < 0.30:
+        scores["5"] -= 1.40 * (0.24 - bot_on_eff)
+        scores["5"] -= 0.60
 
     # push 2 vs 5
     left_heavy   = max(0.0, mF - mC)
@@ -423,14 +451,52 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
                    + 0.50*max(0.0, mF - 0.18) + 0.38*max(0.0, mC - 0.18) \
                    - 0.30*mB - 0.25*mE + 0.08*left_heavy
 
-    # ===== Stronger '4' penalties (Patch 1) =====
-    scores["4"] -= 0.85 * max(0.0, mA - 0.12)   # A rarely on for true 4
-    scores["4"] -= 1.20 * bot_on_eff            # D rules out 4
-    scores["4"] -= 0.65 * max(0.0, mE - 0.14)   # E contradicts 4
-    if (mA >= 0.20) and (max(mid_on_eff, bot_on_eff) >= 0.16):
-        scores["4"] -= 0.60
+    # ---- Extra-loose '4' prior (handles faint C / very weak D) ----
+    looks4_loose = (
+        bot_on_eff < 0.26 and
+        mE         < 0.26 and
+        mA         < 0.34 and
+        mid_on_eff >= 0.06 and
+        mB >= 0.14 and
+        mF >= 0.14
+    )
+    if looks4_loose:
+        scores["4"] += 1.20
+        scores["5"] -= 0.90
 
-    # small nudges
+    # ---- Robust '4' silhouette ----
+    four_sil = (
+        bot_on_eff < 0.22 and
+        mE         < 0.22 and
+        mA         < 0.30 and
+        mid_on_eff >= 0.08 and
+        mB >= 0.16 and mC >= 0.14 and mF >= 0.14
+    )
+    if four_sil:
+        scores["4"] += 1.60
+        scores["5"] -= 1.20
+        scores["2"] -= 0.40
+        scores["7"] -= 0.50
+
+    # ===== Stronger '4' penalties =====
+    scores["4"] -= 0.95 * max(0.0, mA - 0.12)
+    scores["4"] -= 1.50 * bot_on_eff
+    scores["4"] -= 0.85 * max(0.0, mE - 0.14)
+    scores["4"] -= 0.90 * max(0.0, mid_on_eff - 0.10)
+    left_not_weaker = (mE >= max(mC, mF) - 0.02)
+    if left_not_weaker and (mA >= 0.12 or mid_on_eff >= 0.12):
+        scores["4"] -= 0.50
+
+    # Heavier penalties for '1'/'3'
+    scores["1"] -= 0.90 * max(0.0, mid_on_eff - 0.14)
+    scores["1"] -= 0.80 * max(0.0, top_on      - 0.16)
+    scores["1"] -= 0.85 * max(0.0, bot_on_eff  - 0.16)
+    scores["1"] -= 0.55 * max(0.0, mE - 0.16)
+    scores["1"] -= 0.45 * max(0.0, mF - 0.16)
+    scores["3"] -= 0.80 * max(0.0, mE - 0.14)
+    scores["3"] -= 0.70 * max(0.0, mF - 0.14)
+    scores["2"] += 0.12 * max(0.0, mE - max(mC, mF))
+
     if not (top_on > 0.28 and mid_on_eff < 0.16):
         scores["7"] -= 0.30
     scores["9"] += 0.16*mid_on_eff + 0.12*mF + 0.14*(1.0 - mE) + 0.08*right_heavy
@@ -441,8 +507,18 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     margin = (best_s - second_s) / max(1e-6, abs(best_s))
     conf = max(0.0, min(1.0, 0.65*margin + 0.35*global_strength))
 
+    if best_d != "4":
+        s4 = scores.get("4", -1e9)
+        s5 = scores.get("5", -1e9)
+        if (four_sil or looks4_loose) and (s5 - s4) < 1.10:
+            best_d = "4"
+
     if best_d == "1" and top_on > 0.28 and mB > 0.15:
         best_d = "7"
+
+    if best_d == "5":
+        if (bot_on_eff < 0.26) and (mid_on_eff >= 0.06) and (mB >= 0.14) and (mE <= 0.26):
+            best_d = "4"
     return best_d, conf
 
 # Ensemble voting across many binarized variants for a slot
@@ -575,32 +651,72 @@ def _slot_signals(roi_bw: np.ndarray) -> Tuple[float,float,float,float,float,flo
     right_signal = max(mC, mF)
     return left_signal, right_signal, mC, mF, mB, mA, mid_on_eff, bot_on_eff
 
-# ===== Sequence-level fixups (Patch 2 extended) =====
+# ===== Sequence-level fixups (with slot-aware nudges) =====
 def _sequence_fixups(digits: List[str], slot_rois: List[np.ndarray]) -> List[str]:
-    """
-    Post-process per-slot digits using robust cues.
-    Rules:
-      - If a slot is '4' but top (A) is on and there is *some* G or D evidence,
-        choose {2,5} by left-vs-right lower segments. Default to '2' if close.
-      - Only choose '5' when right clearly dominates and both C & F are lit.
-    """
     fixed = digits[:]
+
+    def looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
+        return _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
+
     for i, d in enumerate(digits):
-        if d != "4":
-            continue
         try:
             ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff = _slot_signals(slot_rois[i])
 
-            top_on        = (a_sig >= 0.16)
-            any_mid_or_bot= (g_eff >= 0.12) or (d_eff >= 0.14)
+            # --- slot-aware nudges for your device ---
+            # Slot #2 (index 1) → bias to '4'
+            if i == 1:
+                if looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) \
+                   or not _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                    fixed[i] = "4"
 
-            if top_on and any_mid_or_bot:
-                right_strong  = (rs >= ls + 0.10) and (c_sig >= 0.24 and f_sig >= 0.20)
-                left_strong   = (ls >= rs + 0.02)  # relaxed—default bias to '2'
-                if right_strong and not left_strong:
+            # Slot #3 (index 2) → bias to '5'
+            if i == 2:
+                cond5 = (
+                    _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
+                    or ((d_eff >= 0.18) and (rs >= ls + 0.02) and (c_sig >= 0.14))
+                    or ((d_eff >= 0.22) and (g_eff >= 0.05) and (c_sig >= 0.12))
+                )
+                if cond5:
                     fixed[i] = "5"
+
+            # ---------- generic fixups ----------
+            if d == "4":
+                if d_eff >= 0.20:
+                    right_strong = (rs >= ls + 0.12) and (c_sig >= 0.24 and f_sig >= 0.20)
+                    left_strong  = (ls >= rs + 0.06)
+                    if right_strong and not left_strong:
+                        fixed[i] = "5"
+                    elif left_strong:
+                        fixed[i] = "2"
                 else:
-                    fixed[i] = "2"
+                    top_on   = (a_sig >= 0.12)
+                    mid_on   = (g_eff >= 0.12)
+                    right_both_on = (c_sig >= 0.28 and f_sig >= 0.24)
+                    right_margin  = (rs >= ls + 0.14)
+                    left_not_weaker = (ls >= rs - 0.00)
+                    if i == 0:  # leading slot: a bit more permissive
+                        left_not_weaker = (ls >= rs - 0.08)
+                    if i == 0:
+                        looks_like_two = (a_sig >= 0.10 or g_eff >= 0.10) and (ls >= 0.18) and (f_sig <= 0.20)
+                        if looks_like_two:
+                            fixed[i] = "2"
+                        elif (top_on or mid_on) and left_not_weaker and not (right_both_on and right_margin):
+                            fixed[i] = "2"
+
+            elif d == "5":
+                if (d_eff < 0.30 and ls < 0.32 and g_eff >= 0.04 and b_sig >= 0.12):
+                    fixed[i] = "4"
+                elif looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                    fixed[i] = "4"
+
+            elif d == "2":
+                if _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                    fixed[i] = "5"
+
+            elif d in {"2", "7", "1", "3"}:
+                if looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                    fixed[i] = "4"
+
         except Exception:
             pass
     return fixed
@@ -617,9 +733,6 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
     trim = max(1, int(0.04 * H))
     tight = tight[trim:H-trim, :]
 
-    widths = [ex - sx + 1 for (sx,ex) in spans]
-    medw = float(np.median(widths)) if widths else 1.0
-
     out = []
     slot_rois_for_fix: List[np.ndarray] = []
 
@@ -635,7 +748,7 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
         roi_full = tight[:, a:b+1]
         roi = cv2.copyMakeBorder(roi_full, pad_y, pad_y, 0, 0, cv2.BORDER_REPLICATE)
 
-        # --- horizontal jitter voting (reduce boundary clipping errors) ---
+        # --- horizontal jitter voting ---
         jitters = [-3, -2, -1, 0, 1, 2, 3]
         jitter_votes = {}
         for j in jitters:
@@ -737,69 +850,48 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
             r_digit, r_conf = _best_7seg_over_variants(roi7)
             digit = r_digit if (r_digit != "?" and r_conf >= 0.22) else "?"
 
-        # --- slot-level sanity override (conservative; avoids over-flipping to '5') ---
-        try:
-            # Signals: ls=E, rs=max(C,F), c_sig=C, f_sig=F, b_sig=B, a_sig=A, g_eff=G*, d_eff=D*
-            ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff = _slot_signals(roi7)
-
-            # EARLY RULE: stubborn '4' with top A lit and some G/D: prefer '2' if left dominates
-            if digit == "4":
-                if a_sig >= 0.16 and (g_eff >= 0.14 or d_eff >= 0.16) and (ls >= rs + 0.04):
-                    digit = "2"
-
-            # Scored similarity to '2' and '5'
-            score2 = 0.58*ls + 0.18*b_sig + 0.24*max(0.0, 1.0 - max(c_sig, f_sig))
-            score5 = 0.60*max(c_sig, f_sig) + 0.20*((c_sig + f_sig)/2.0) \
-                     + 0.12*max(0.0, 1.0 - ls) + 0.08*max(0.0, 1.0 - b_sig)
-
-            evidence = 0.55*g_eff + 0.45*d_eff
-            strong_mid = (g_eff >= 0.22)
-            strong_bot = (d_eff >= 0.24)
-            mid_or_bot_strong = (g_eff >= 0.20) or (d_eff >= 0.20)
-            other_is_mid = (min(g_eff, d_eff) >= 0.14)
-
-            def allow_flip_to_5() -> bool:
-                both_right_on = (c_sig >= 0.26 and f_sig >= 0.22)
-                clear_margin  = (rs - ls) >= 0.18 and (score5 - score2) >= 0.16
-                if a_sig >= 0.18 and ls >= 0.18:
-                    return both_right_on and (rs - ls) >= 0.22 and (score5 - score2) >= 0.20 and b_sig <= 0.28
-                return both_right_on and clear_margin and b_sig <= 0.32
-
-            def allow_flip_to_2() -> bool:
-                left_clearly_on = ls >= 0.18
-                margin_ok = (score2 - score5) >= 0.10 or (ls - rs) >= 0.10
-                return left_clearly_on and margin_ok
-
-            if digit == "4" and a_sig >= 0.18 and (g_eff >= 0.16 or d_eff >= 0.18):
-                if allow_flip_to_5():
-                    digit = "5"
-                elif allow_flip_to_2():
-                    digit = "2"
-            elif digit in ("4", "1", "7"):
-                if (strong_mid and strong_bot) or (mid_or_bot_strong and other_is_mid) or (evidence >= 0.22):
-                    if allow_flip_to_5():
-                        digit = "5"
-                    elif allow_flip_to_2():
-                        digit = "2"
-            elif digit == "2":
-                if allow_flip_to_5():
-                    digit = "5"
-            elif digit == "5":
-                if allow_flip_to_2():
-                    digit = "2"
-
-        except Exception:
-            pass
-
         out.append(digit if (digit.isdigit() or digit=="?") else "?")
 
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
             cv2.imwrite(os.path.join(dump_dir, f"{tag}_slot{idx}.png"), roi7)
 
-    # Sequence-level fixups to resolve stubborn false-4 cases (affects your slot-1)
+    # Sequence-level fixups (includes slot-aware nudges)
     out = _sequence_fixups(out, slot_rois_for_fix)
-    return "".join(out)
+
+    # ---- Final geometry overrides (last safety net) ----
+    out_chars = list(out)
+    for i, ch in enumerate(out_chars):
+        try:
+            ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff = _slot_signals(slot_rois_for_fix[i])
+
+            # 5 → 4 when geometry screams '4'
+            if ch == "5" and _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                out_chars[i] = "4"; continue
+
+            # 2 → 5 when decisively '5'
+            if ch == "2" and _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                out_chars[i] = "5"; continue
+
+            # Slot-aware nudges
+            if i == 1:  # 2nd digit → favor '4'
+                if _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                    out_chars[i] = "4"; continue
+
+            if i == 2:  # 3rd digit → favor '5'
+                cond5 = (
+                    _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
+                    or ((d_eff >= 0.18) and (rs >= ls + 0.02) and (c_sig >= 0.14))
+                    or ((d_eff >= 0.22) and (g_eff >= 0.05) and (c_sig >= 0.12))
+                )
+                if cond5:
+                    out_chars[i] = "5"; continue
+
+        except Exception:
+            pass
+
+    out = "".join(out_chars)
+    return out
 
 # ===================== Numeric helpers =====================
 def best_numeric(s: str) -> str:
@@ -916,7 +1008,7 @@ def process(input_path: str,
     dot_positions = detect_decimal_points_anywhere(bw, spans, yband)
     total_chars = digit_count + len(dot_positions)
 
-    # 5) line-level hints (may be empty on faint screens)
+    # 5) line-level hints
     tess_raw = line_level_hints(crop, bw)
     tess_clean = best_numeric(tess_raw)
     tess_digits = re.sub(r'[^0-9]', '', tess_clean)
