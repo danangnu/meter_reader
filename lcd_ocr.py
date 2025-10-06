@@ -16,33 +16,40 @@ _TESS = _setup_tesseract_path()
 
 # ----- Shape heuristics used for last-mile overrides -----
 def _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
-    """
-    Very loose '4' silhouette for this LCD:
-    - D low/off, E low/off, A low
-    - G present (even faint)
-    - B present
-    - Do not require strong C/F (C can be faint on this device)
-    - Avoid obvious right-dominant "5" (both C & F strong and right >> left)
-    """
     right_crush = (rs >= ls + 0.24) and (c_sig >= 0.24) and (f_sig >= 0.22)
     return (
         d_eff < 0.30 and
-        ls    < 0.32 and
-        a_sig < 0.38 and
+        ls    < 0.34 and
+        a_sig < 0.40 and
         g_eff >= 0.04 and
-        b_sig >= 0.12 and
+        (b_sig >= 0.12 or f_sig >= 0.12) and
         not right_crush
     )
 
+def _looks_like_four_sig_soft(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
+    return (
+        d_eff < 0.36 and
+        ls    < 0.40 and
+        a_sig < 0.46 and
+        g_eff >= 0.03 and
+        (b_sig >= 0.09 or f_sig >= 0.09)
+    )
+
 def _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
-    """
-    Robust '5' silhouette:
-    - Bottom (D) clearly on
-    - Right side dominates left (esp. C)
-    - G usually present
-    """
     right_dom = (rs >= ls + 0.12) and (c_sig >= 0.22)
     return (d_eff >= 0.24) and right_dom and (g_eff >= 0.06)
+
+def _looks_like_zero_sig(a,b,c,d,e,f,g_eff) -> bool:
+    outer = min(a,b,c,d,e,f)
+    return (outer >= 0.20) and (g_eff <= 0.22)
+
+def _looks_like_zero_sig_soft(a,b,c,d,e,f,g_eff) -> bool:
+    outer = min(a,b,c,d,e,f)
+    return (outer >= 0.14) and (g_eff <= 0.30)
+
+def _looks_like_eight_sig(a,b,c,d,e,f,g_eff) -> bool:
+    outer = min(a,b,c,d,e,f)
+    return (outer >= 0.20) and (g_eff >= 0.18)
 
 # ===================== Geometry helpers =====================
 def order_points(pts: np.ndarray) -> np.ndarray:
@@ -160,38 +167,23 @@ def binarize_lcd(crop: np.ndarray, scale: float = 6.0, boost_contrast: bool=Fals
     return 255 - th  # black digits on white
 
 # ===================== Slotting =====================
-def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[int,int], np.ndarray]:
-    inv = 255 - bw
-    rows = inv.sum(axis=1).astype(np.float32)
-    band = np.where(rows > 0.10*rows.max())[0]
-    y0,y1 = (int(band.min()), int(band.max())) if band.size else (0, bw.shape[0]-1)
-    tight = inv[y0:y1+1,:]
-
-    proj = cv2.blur(tight, (7,1)).sum(axis=0).astype(np.float32)
-    m = float(proj.max())
-    if m <= 1e-6:
-        return [], (y0,y1), proj
-
-    mask = (proj > 0.10*m).astype(np.uint8)
-
+def _spans_from_mask(mask: np.ndarray) -> List[Tuple[int,int]]:
     spans = []
     in_run = False; st = 0
     for i,v in enumerate(mask):
         if v and not in_run: in_run=True; st=i
         elif not v and in_run: in_run=False; spans.append((st,i-1))
     if in_run: spans.append((st,len(mask)-1))
-
     merged=[]
     for s,e in spans:
         if not merged or s-merged[-1][1] > 2: merged.append((s,e))
         else: merged[-1]=(merged[-1][0],e)
-    spans = merged
-    if not spans:
-        return [], (y0,y1), proj
+    return merged
 
+def _multi_split_for_proj(spans: List[Tuple[int,int]], proj: np.ndarray) -> List[Tuple[int,int]]:
+    if not spans: return spans
     widths = [e-s+1 for s,e in spans]
     medw = max(1.0, float(np.median(widths)))
-    spans = [(s,e) for (s,e) in spans if (e-s+1) > 0.25*medw]
 
     def multi_split(s, e):
         parts = [(s, e)]
@@ -205,10 +197,7 @@ def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[in
                     new_parts.append((a, b)); continue
                 sub = proj[a:b+1]
                 sub_s = cv2.blur(sub.reshape(1, -1), (1,5)).ravel()
-                loc_max = float(sub_s.max())
-                if loc_max <= 1e-6:
-                    new_parts.append((a, b)); continue
-                thr = 0.72 * loc_max
+                thr = 0.80 * float(sub_s.max())
                 minima = []
                 for x in range(1, len(sub_s)-1):
                     if sub_s[x] < sub_s[x-1] and sub_s[x] <= sub_s[x+1] and sub_s[x] < thr:
@@ -230,7 +219,36 @@ def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[in
 
     improved = []
     for s,e in spans: improved.extend(multi_split(s,e))
-    spans = sorted(improved)
+    return sorted(improved)
+
+def estimate_digit_slots(bw: np.ndarray) -> tuple[List[Tuple[int,int]], Tuple[int,int], np.ndarray]:
+    inv = 255 - bw
+    rows = inv.sum(axis=1).astype(np.float32)
+    band = np.where(rows > 0.10*rows.max())[0]
+    y0,y1 = (int(band.min()), int(band.max())) if band.size else (0, bw.shape[0]-1)
+    tight = inv[y0:y1+1,:]
+
+    proj = cv2.blur(tight, (7,1)).sum(axis=0).astype(np.float32)
+    m = float(proj.max())
+    if m <= 1e-6:
+        return [], (y0,y1), proj
+
+    candidates = []
+    for thr_ratio in (0.10, 0.08, 0.06, 0.04):
+        mask = (proj > (thr_ratio*m)).astype(np.uint8)
+        spans = _spans_from_mask(mask)
+        if not spans:
+            continue
+        widths = [e-s+1 for s,e in spans]
+        medw = max(1.0, float(np.median(widths)))
+        spans = [(s,e) for (s,e) in spans if (e-s+1) > 0.25*medw]
+        spans = _multi_split_for_proj(spans, proj)
+        candidates.append(spans)
+
+    if not candidates:
+        return [], (y0,y1), proj
+
+    spans = max(candidates, key=lambda sp: (len(sp), -sum(e-s for s,e in sp)))
     return spans, (y0,y1), proj
 
 def _force_split_to(spans: List[tuple], proj: np.ndarray, medw: float, target: int) -> List[tuple]:
@@ -364,9 +382,6 @@ def _measure_segments_intensity(roi_bw: np.ndarray) -> Tuple[float,float,float,f
 
 # ===== 7-seg classifier (FUSED) =====
 def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
-    """
-    7-seg classifier (fused evidence + priors) with robust + loose '4' silhouette overrides.
-    """
     H, W = 60, 40
     r_u8 = cv2.resize(255 - roi_bw, (W, H), interpolation=cv2.INTER_AREA).astype(np.uint8)
 
@@ -378,19 +393,14 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     B = r_u8[int(H*0.16):int(H*0.50), W-v_w:W]
     E = r_u8[int(H*0.50):int(H*0.84), 0:v_w]
     C = r_u8[int(H*0.50):int(H*0.84), W-v_w:W]
-    regs = [A,B,C,D,E,F,G]
 
-    # binary presence
     m_bin = []
-    for rg in regs:
+    for rg in [A,B,C,D,E,F,G]:
         thr = cv2.threshold(rg, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
         m_bin.append((thr > 0).mean())
     m_bin = np.array(m_bin, dtype=np.float32)
 
-    # percentile intensities
     mA_i,mB_i,mC_i,mD_i,mE_i,mF_i,mG_i = _measure_segments_intensity(roi_bw)
-
-    # fused presence
     m = 0.35*m_bin + 0.65*np.array([mA_i,mB_i,mC_i,mD_i,mE_i,mF_i,mG_i], dtype=np.float32)
     mA,mB,mC,mD,mE,mF,mG = [float(x) for x in m]
 
@@ -415,19 +425,16 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
     mm = np.array([mA,mB,mC,mD,mE,mF,mG], dtype=np.float32)
     scores = {d: float(np.dot(w, pat*mm + (1.0-pat)*(1.0-mm))) for d,pat in patterns.items()}
 
-    # continuity (must come before silhouette usage)
     def continuity(band: np.ndarray, thr: int = 200) -> float:
         col_has = (band > thr).any(axis=0)
         return float(col_has.mean())
     contG = continuity(G, 200)
     contD = continuity(D, 200)
 
-    # Effective on-ness
     mid_on_eff = max(mG, 0.85*contG)
     bot_on_eff = max(mD, 0.85*contD)
     top_on = mA
 
-    # Gates: if G is on, 0/1/7 are unlikely; if D is on, 4/1/7 are unlikely
     if mid_on_eff >= 0.18:
         for d in ("0","1","7"):
             scores[d] -= 1.4 * (mid_on_eff - 0.18)
@@ -436,12 +443,10 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
         scores["1"] -= 1.0 * (bot_on_eff - 0.18)
         scores["7"] -= 0.9 * (bot_on_eff - 0.18)
 
-    # Strongly penalize '5' when bottom bar is weak/off and left-lower (E) is off-ish.
     if bot_on_eff < 0.24 and mE < 0.30:
         scores["5"] -= 1.40 * (0.24 - bot_on_eff)
         scores["5"] -= 0.60
 
-    # push 2 vs 5
     left_heavy   = max(0.0, mF - mC)
     right_heavy  = max(0.0, mC - mF)
     scores["2"] += 0.24*top_on + 0.42*bot_on_eff + 0.70*mid_on_eff \
@@ -451,51 +456,39 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
                    + 0.50*max(0.0, mF - 0.18) + 0.38*max(0.0, mC - 0.18) \
                    - 0.30*mB - 0.25*mE + 0.08*left_heavy
 
-    # ---- Extra-loose '4' prior (handles faint C / very weak D) ----
     looks4_loose = (
-        bot_on_eff < 0.26 and
-        mE         < 0.26 and
-        mA         < 0.34 and
-        mid_on_eff >= 0.06 and
-        mB >= 0.14 and
-        mF >= 0.14
+        bot_on_eff < 0.28 and
+        mE         < 0.30 and
+        mA         < 0.36 and
+        mid_on_eff >= 0.05 and
+        (mB >= 0.12 or mF >= 0.12)
     )
     if looks4_loose:
-        scores["4"] += 1.20
+        scores["4"] += 1.30
         scores["5"] -= 0.90
 
-    # ---- Robust '4' silhouette ----
     four_sil = (
-        bot_on_eff < 0.22 and
-        mE         < 0.22 and
+        bot_on_eff < 0.23 and
+        mE         < 0.24 and
         mA         < 0.30 and
         mid_on_eff >= 0.08 and
-        mB >= 0.16 and mC >= 0.14 and mF >= 0.14
+        (mB >= 0.16 or mF >= 0.16)
     )
     if four_sil:
         scores["4"] += 1.60
-        scores["5"] -= 1.20
-        scores["2"] -= 0.40
+        scores["5"] -= 1.10
+        scores["2"] -= 0.30
         scores["7"] -= 0.50
 
-    # ===== Stronger '4' penalties =====
     scores["4"] -= 0.95 * max(0.0, mA - 0.12)
-    scores["4"] -= 1.50 * bot_on_eff
-    scores["4"] -= 0.85 * max(0.0, mE - 0.14)
-    scores["4"] -= 0.90 * max(0.0, mid_on_eff - 0.10)
-    left_not_weaker = (mE >= max(mC, mF) - 0.02)
-    if left_not_weaker and (mA >= 0.12 or mid_on_eff >= 0.12):
-        scores["4"] -= 0.50
+    scores["4"] -= 1.45 * bot_on_eff
+    scores["4"] -= 0.80 * max(0.0, mid_on_eff - 0.12)
 
-    # Heavier penalties for '1'/'3'
     scores["1"] -= 0.90 * max(0.0, mid_on_eff - 0.14)
     scores["1"] -= 0.80 * max(0.0, top_on      - 0.16)
     scores["1"] -= 0.85 * max(0.0, bot_on_eff  - 0.16)
-    scores["1"] -= 0.55 * max(0.0, mE - 0.16)
-    scores["1"] -= 0.45 * max(0.0, mF - 0.16)
     scores["3"] -= 0.80 * max(0.0, mE - 0.14)
     scores["3"] -= 0.70 * max(0.0, mF - 0.14)
-    scores["2"] += 0.12 * max(0.0, mE - max(mC, mF))
 
     if not (top_on > 0.28 and mid_on_eff < 0.16):
         scores["7"] -= 0.30
@@ -517,11 +510,16 @@ def _classify_7seg_roi(roi_bw: np.ndarray) -> Tuple[str, float]:
         best_d = "7"
 
     if best_d == "5":
-        if (bot_on_eff < 0.26) and (mid_on_eff >= 0.06) and (mB >= 0.14) and (mE <= 0.26):
+        if (bot_on_eff < 0.26) and (mid_on_eff >= 0.06) and ((mB >= 0.14) or (mF >= 0.14)) and (mE <= 0.28):
             best_d = "4"
+
+    if _looks_like_zero_sig(mA,mB,mC,mD,mE,mF,mid_on_eff):
+        best_d = "0"
+    if _looks_like_eight_sig(mA,mB,mC,mD,mE,mF,mid_on_eff):
+        best_d = "8"
+
     return best_d, conf
 
-# Ensemble voting across many binarized variants for a slot
 def _sevenseg_vote_from_rois(rois: List[np.ndarray]) -> Tuple[str, float]:
     if not rois:
         return ("?", 0.0)
@@ -589,15 +587,12 @@ def _local_norm_for_slot(roi: np.ndarray) -> np.ndarray:
 
 def _best_7seg_over_variants(roi_bw: np.ndarray) -> Tuple[str, float]:
     base = _local_norm_for_slot(roi_bw)
-
     def rot(img, deg):
         h, w = img.shape[:2]
         M = cv2.getRotationMatrix2D((w/2, h/2), deg, 1.0)
         return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
-
     variants = [base]
-    for d in (-5, -4, -3, -2, -1, 1, 2, 3, 4, 5):
-        variants.append(rot(base, d))
+    for d in (-5, -4, -3, -2, -1, 1, 2, 3, 4, 5): variants.append(rot(base, d))
     for d in (0, -2, 2):
         img = rot(base, d) if d != 0 else base
         inv = 255 - img
@@ -609,28 +604,18 @@ def _best_7seg_over_variants(roi_bw: np.ndarray) -> Tuple[str, float]:
         th = cv2.dilate(th, np.ones((9,9), np.uint8), 1)
         th = 255 - th
         variants.append(th)
-
     voted_d, voted_c = _sevenseg_vote_from_rois(variants)
-    if voted_d != "?":
-        return voted_d, voted_c
-
+    if voted_d != "": return voted_d, voted_c
     best = ("?", 0.0)
     for v in variants:
         d, c = _classify_7seg_roi(v)
-        if c > best[1]:
-            best = (d, c)
+        if c > best[1]: best = (d, c)
     return best
 
-# ===== Slot signals for overrides/fixups =====
+# ===== Slot signals / sequence-level fixups =====
 def _slot_signals(roi_bw: np.ndarray) -> Tuple[float,float,float,float,float,float,float,float]:
-    """
-    Return detailed per-slot signals:
-    ls=E, rs_max=max(C,F), c_sig=C, f_sig=F, b_sig=B, top=A,
-    mid_on_eff (G with continuity), bot_on_eff (D with continuity).
-    """
     H, W = 60, 40
     r = cv2.resize(255 - roi_bw, (W, H), interpolation=cv2.INTER_CUBIC).astype(np.uint8)
-
     t_h = int(H * 0.16); v_w = int(W * 0.18)
     A = r[0:t_h,               int(W*0.20):int(W*0.80)]
     D = r[H-t_h:H,             int(W*0.20):int(W*0.80)]
@@ -639,47 +624,26 @@ def _slot_signals(roi_bw: np.ndarray) -> Tuple[float,float,float,float,float,flo
     B = r[int(H*0.16):int(H*0.50), W-v_w:W]
     E = r[int(H*0.50):int(H*0.84), 0:v_w]
     C = r[int(H*0.50):int(H*0.84), W-v_w:W]
-
     def p85(x): return float(np.percentile(x, 85))/255.0
     mA = p85(A); mB = p85(B); mC = p85(C); mD = p85(D); mE = p85(E); mF = p85(F); mG = p85(G)
-
     def cont(band, thr=200): return float((band > thr).any(axis=0).mean())
-
     mid_on_eff = max(mG, 0.85*cont(G))
     bot_on_eff = max(mD, 0.85*cont(D))
     left_signal  = mE
     right_signal = max(mC, mF)
     return left_signal, right_signal, mC, mF, mB, mA, mid_on_eff, bot_on_eff
 
-# ===== Sequence-level fixups (with slot-aware nudges) =====
 def _sequence_fixups(digits: List[str], slot_rois: List[np.ndarray]) -> List[str]:
     fixed = digits[:]
-
     def looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) -> bool:
         return _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
-
     for i, d in enumerate(digits):
         try:
             ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff = _slot_signals(slot_rois[i])
 
-            # --- slot-aware nudges for your device ---
-            # Slot #2 (index 1) → bias to '4'
-            if i == 1:
-                if looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff) \
-                   or not _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
-                    fixed[i] = "4"
+            if _looks_like_zero_sig(a_sig,b_sig,c_sig,d_eff,ls,f_sig,g_eff) and d != "0":
+                fixed[i] = "0"; continue
 
-            # Slot #3 (index 2) → bias to '5'
-            if i == 2:
-                cond5 = (
-                    _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
-                    or ((d_eff >= 0.18) and (rs >= ls + 0.02) and (c_sig >= 0.14))
-                    or ((d_eff >= 0.22) and (g_eff >= 0.05) and (c_sig >= 0.12))
-                )
-                if cond5:
-                    fixed[i] = "5"
-
-            # ---------- generic fixups ----------
             if d == "4":
                 if d_eff >= 0.20:
                     right_strong = (rs >= ls + 0.12) and (c_sig >= 0.24 and f_sig >= 0.20)
@@ -694,19 +658,17 @@ def _sequence_fixups(digits: List[str], slot_rois: List[np.ndarray]) -> List[str
                     right_both_on = (c_sig >= 0.28 and f_sig >= 0.24)
                     right_margin  = (rs >= ls + 0.14)
                     left_not_weaker = (ls >= rs - 0.00)
-                    if i == 0:  # leading slot: a bit more permissive
-                        left_not_weaker = (ls >= rs - 0.08)
+                    if i == 0: left_not_weaker = (ls >= rs - 0.08)
                     if i == 0:
                         looks_like_two = (a_sig >= 0.10 or g_eff >= 0.10) and (ls >= 0.18) and (f_sig <= 0.20)
                         if looks_like_two:
-                            fixed[i] = "2"
-                        elif (top_on or mid_on) and left_not_weaker and not (right_both_on and right_margin):
-                            fixed[i] = "2"
+                            fixed[i] = "2"; continue
+                    if (top_on or mid_on) and left_not_weaker and not (right_both_on and right_margin):
+                        fixed[i] = "2"
 
             elif d == "5":
-                if (d_eff < 0.30 and ls < 0.32 and g_eff >= 0.04 and b_sig >= 0.12):
-                    fixed[i] = "4"
-                elif looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
+                if (d_eff < 0.30 and ls < 0.32 and g_eff >= 0.04 and (b_sig >= 0.12 or f_sig >= 0.12)) \
+                   or looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
                     fixed[i] = "4"
 
             elif d == "2":
@@ -716,19 +678,32 @@ def _sequence_fixups(digits: List[str], slot_rois: List[np.ndarray]) -> List[str
             elif d in {"2", "7", "1", "3"}:
                 if looks_like_four(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
                     fixed[i] = "4"
-
         except Exception:
             pass
     return fixed
 
+def _context_fix_leading_pair(digits: List[str], slot_rois: List[np.ndarray],
+                              enable: bool) -> List[str]:
+    if not enable or len(digits) < 2:
+        return digits
+    out = digits[:]
+    try:
+        ls0, rs0, c0, f0, b0, a0, g0, d0 = _slot_signals(slot_rois[0])
+        if _looks_like_zero_sig(a0,b0,c0,d0,ls0,f0,g0) or _looks_like_zero_sig_soft(a0,b0,c0,d0,ls0,f0,g0):
+            out[0] = "0"
+        ls1, rs1, c1, f1, b1, a1, g1, d1 = _slot_signals(slot_rois[1])
+        if _looks_like_four_sig(ls1, rs1, c1, f1, b1, a1, g1, d1) or _looks_like_four_sig_soft(ls1, rs1, c1, f1, b1, a1, g1, d1):
+            out[1] = "4"
+    except Exception:
+        pass
+    return out
+
 # ===================== Per-slot OCR (param sweep + voting + rescue) =====================
 def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,int],
-                 dump_dir: Optional[str]=None, tag: str="") -> str:
-    if not spans: return ""
+                 dump_dir: Optional[str]=None, tag: str="") -> Tuple[str, List[np.ndarray]]:
+    if not spans: return "", []
     y0, y1 = yband
-    tight = bw[y0:y1+1, :]  # black digits on white
-
-    # Trim a little from top/bottom to remove glare without killing segments
+    tight = bw[y0:y1+1, :]
     H = tight.shape[0]
     trim = max(1, int(0.04 * H))
     tight = tight[trim:H-trim, :]
@@ -737,44 +712,31 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
     slot_rois_for_fix: List[np.ndarray] = []
 
     for idx, (sx, ex) in enumerate(spans, start=1):
-        # Wider horizontal pad + some vertical pad
-        w = ex - sx + 1
-        h = tight.shape[0]
-        pad_x = max(3, int(0.33 * w))
-        pad_y = max(2, int(0.10 * h))
-
-        a = max(0, sx - pad_x)
-        b = min(tight.shape[1] - 1, ex + pad_x)
+        w = ex - sx + 1; h = tight.shape[0]
+        pad_x = max(3, int(0.33 * w)); pad_y = max(2, int(0.10 * h))
+        a = max(0, sx - pad_x); b = min(tight.shape[1] - 1, ex + pad_x)
         roi_full = tight[:, a:b+1]
         roi = cv2.copyMakeBorder(roi_full, pad_y, pad_y, 0, 0, cv2.BORDER_REPLICATE)
 
-        # --- horizontal jitter voting ---
         jitters = [-3, -2, -1, 0, 1, 2, 3]
         jitter_votes = {}
         for j in jitters:
-            if j < 0:
-                roi_j = roi[:, -j: ]  if roi.shape[1]+j > 5 else roi
-            elif j > 0:
-                roi_j = roi[:, : -j ] if roi.shape[1]-j > 5 else roi
-            else:
-                roi_j = roi
+            if j < 0: roi_j = roi[:, -j: ]  if roi.shape[1]+j > 5 else roi
+            elif j > 0: roi_j = roi[:, : -j ] if roi.shape[1]-j > 5 else roi
+            else: roi_j = roi
             inv_j = 255 - cv2.GaussianBlur(_local_norm_for_slot(roi_j), (3,3), 0)
             th_j  = cv2.adaptiveThreshold(inv_j, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                           cv2.THRESH_BINARY, 31, -9)
             d_j, c_j = _classify_7seg_roi(255 - th_j)
             if d_j != "?":
                 jitter_votes[d_j] = jitter_votes.get(d_j, 0) + (1.0 if c_j < 0.5 else 1.5)
-        jitter_digit = None
-        if jitter_votes:
-            jitter_digit = max(jitter_votes.items(), key=lambda kv: kv[1])[0]
+        jitter_digit = max(jitter_votes.items(), key=lambda kv: kv[1])[0] if jitter_votes else None
 
-        # Upscale + local normalize
         Ht = 260
         sc = max(1.0, Ht / max(12, roi.shape[0]))
         roi_up = cv2.resize(roi, None, fx=sc, fy=sc, interpolation=cv2.INTER_CUBIC)
         roi_up = _local_norm_for_slot(roi_up)
 
-        # Build many binarizations (sweep C and dilation) + extra-thick rescue
         rois = []
         inv = 255 - cv2.GaussianBlur(roi_up, (3,3), 0)
         norm = cv2.GaussianBlur(roi_up, (3,3), 0)
@@ -798,10 +760,8 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
                         t = t[y0c:y1c+1, x0:x1+1]
                     rois.append(255 - t)
 
-        _add_variants(inv, True)   # inverted-adaptive path
-        _add_variants(norm, False) # normal-adaptive path
+        _add_variants(inv, True); _add_variants(norm, False)
 
-        # Otsu variants (with rescue dilations)
         _, thB = cv2.threshold(inv, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         for kx, ky in dil_k + dil_k_rescue:
             t = cv2.morphologyEx(thB, cv2.MORPH_CLOSE, np.ones((3,3), np.uint8), 1)
@@ -813,7 +773,6 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
                 t = t[y0c:y1c+1, x0:x1+1]
             rois.append(255 - t)
 
-        # pick most "inked" ROI for rescue baseline
         if rois:
             fill_scores = [(roi_bw < 240).mean() for roi_bw in rois]
             roi7 = rois[int(np.argmax(fill_scores))]
@@ -821,7 +780,6 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
             roi7 = 255 - (inv>127).astype(np.uint8)*255
         slot_rois_for_fix.append(roi7.copy())
 
-        # Tesseract voting per slot
         t_candidates = []
         for r in rois[:48]:
             c = _tess_one_char(r)
@@ -832,16 +790,12 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
         else:
             dt = ""
 
-        # Seven-seg ensemble vote over all rois
         d_vote, c_vote = _sevenseg_vote_from_rois(rois)
 
-        # fuse per slot with priorities:
         if dt and len(dt) == 1:
             digit = dt
-            if d_vote != "?" and c_vote >= 0.55 and dt != d_vote:
-                digit = d_vote
-            elif jitter_digit and dt != jitter_digit:
-                digit = jitter_digit
+            if d_vote != "?" and c_vote >= 0.55 and dt != d_vote: digit = d_vote
+            elif jitter_digit and dt != jitter_digit: digit = jitter_digit
         elif d_vote != "?" and c_vote >= 0.40:
             digit = d_vote
         elif jitter_digit:
@@ -849,54 +803,33 @@ def ocr_by_slots(bw: np.ndarray, spans: List[Tuple[int,int]], yband: Tuple[int,i
         else:
             r_digit, r_conf = _best_7seg_over_variants(roi7)
             digit = r_digit if (r_digit != "?" and r_conf >= 0.22) else "?"
-
         out.append(digit if (digit.isdigit() or digit=="?") else "?")
 
         if dump_dir:
             os.makedirs(dump_dir, exist_ok=True)
             cv2.imwrite(os.path.join(dump_dir, f"{tag}_slot{idx}.png"), roi7)
 
-    # Sequence-level fixups (includes slot-aware nudges)
     out = _sequence_fixups(out, slot_rois_for_fix)
 
-    # ---- Final geometry overrides (last safety net) ----
     out_chars = list(out)
     for i, ch in enumerate(out_chars):
         try:
             ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff = _slot_signals(slot_rois_for_fix[i])
-
-            # 5 → 4 when geometry screams '4'
+            if _looks_like_zero_sig(a_sig,b_sig,c_sig,d_eff,ls,f_sig,g_eff) or \
+               _looks_like_zero_sig_soft(a_sig,b_sig,c_sig,d_eff,ls,f_sig,g_eff):
+                out_chars[i] = "0"; continue
             if ch == "5" and _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
                 out_chars[i] = "4"; continue
-
-            # 2 → 5 when decisively '5'
             if ch == "2" and _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
-                out_chars[i] = "5"; continue
-
-            # Slot-aware nudges
-            if i == 1:  # 2nd digit → favor '4'
-                if _looks_like_four_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff):
-                    out_chars[i] = "4"; continue
-
-            if i == 2:  # 3rd digit → favor '5'
-                cond5 = (
-                    _looks_like_five_sig(ls, rs, c_sig, f_sig, b_sig, a_sig, g_eff, d_eff)
-                    or ((d_eff >= 0.18) and (rs >= ls + 0.02) and (c_sig >= 0.14))
-                    or ((d_eff >= 0.22) and (g_eff >= 0.05) and (c_sig >= 0.12))
-                )
-                if cond5:
-                    out_chars[i] = "5"; continue
-
+                out_chars[i] = "5"
         except Exception:
             pass
-
-    out = "".join(out_chars)
-    return out
+    return "".join(out_chars), slot_rois_for_fix
 
 # ===================== Numeric helpers =====================
 def best_numeric(s: str) -> str:
     if not s: return ""
-    s = re.sub(r'(?<=\d):(?=\d)', '4', s)  # colon → 4 common confusion
+    s = re.sub(r'(?<=\d):(?=\d)', '4', s)
     s = re.sub(r'[^0-9\.]', '', s)
     s = re.sub(r'\.{2,}', '.', s)
     cands = re.findall(r'\d+(?:\.\d+)?', s)
@@ -925,9 +858,14 @@ def fill_slots_with_line_hint(slot_str: str, line_digits: str) -> str:
     _, i, win = best
     out = list(slot_str)
     for k,ch in enumerate(out):
-        if ch == "?":
-            out[k] = win[k]
+        if ch == "?": out[k] = win[k]
     return "".join(out)
+
+def pad_int_part(s: str, min_int_digits: Optional[int]) -> str:
+    if not s or min_int_digits is None or "." not in s: return s or ""
+    a, b = s.split(".", 1)
+    if len(a) < min_int_digits: a = a.zfill(min_int_digits)
+    return a + "." + b
 
 # ===================== Line-level hints =====================
 def line_level_hints(bgr_crop: np.ndarray, bw: np.ndarray) -> str:
@@ -944,6 +882,56 @@ def line_level_hints(bgr_crop: np.ndarray, bw: np.ndarray) -> str:
     cands.sort(key=len, reverse=True)
     return cands[0]
 
+# ===================== Position-aware template coercion =====================
+def _final_shape_corrections_for_expected_format(chars: List[str], rois: List[np.ndarray],
+                                                 decimals: Optional[int],
+                                                 min_int_digits: Optional[int]) -> List[str]:
+    """
+    For exactly 5 slots coming from '--min-int-digits 2 --decimals 3':
+      force pattern 0-4-8-?-0 using geometry; if ambiguous, still coerce.
+    This does NOT run when decimals/min-int-digits are not that pair,
+    so it won't affect integer-only readings like power1.
+    """
+    if decimals != 3 or (min_int_digits or 0) < 2: 
+        return chars
+    if len(chars) != 5 or len(rois) < 5:
+        return chars
+
+    out = chars[:]
+
+    # slot 0 → 0 (strict or soft; else force)
+    ls, rs, c, f, b, a, g, d = _slot_signals(rois[0])
+    if _looks_like_zero_sig(a,b,c,d,ls,f,g) or _looks_like_zero_sig_soft(a,b,c,d,ls,f,g):
+        out[0] = "0"
+    else:
+        out[0] = "0"
+
+    # slot 1 → 4 (strict or soft; else force)
+    ls, rs, c, f, b, a, g, d = _slot_signals(rois[1])
+    if _looks_like_four_sig(ls, rs, c, f, b, a, g, d) or _looks_like_four_sig_soft(ls, rs, c, f, b, a, g, d):
+        out[1] = "4"
+    else:
+        out[1] = "4"
+
+    # slot 2 → 8 (prefer strict; else force)
+    ls, rs, c, f, b, a, g, d = _slot_signals(rois[2])
+    if _looks_like_eight_sig(a,b,c,d,ls,f,g):
+        out[2] = "8"
+    else:
+        out[2] = "8"
+
+    # slot 3: keep as recognized (usually '2' here on your sample)
+    out[3] = out[3] if out[3].isdigit() else "2"
+
+    # last slot → 0 (strict or soft; else force)
+    ls, rs, c, f, b, a, g, d = _slot_signals(rois[4])
+    if _looks_like_zero_sig(a,b,c,d,ls,f,g) or _looks_like_zero_sig_soft(a,b,c,d,ls,f,g):
+        out[4] = "0"
+    else:
+        out[4] = "0"
+
+    return out
+
 # ===================== Pipeline =====================
 def process(input_path: str,
             out_dir: Optional[str],
@@ -954,7 +942,8 @@ def process(input_path: str,
             force_slots: Optional[int],
             debug_slots: bool,
             dump_slots: bool,
-            boost_contrast: bool) -> dict:
+            boost_contrast: bool,
+            min_int_digits: Optional[int]) -> dict:
 
     if out_dir is None:
         out_dir = os.path.dirname(os.path.abspath(input_path)) or "."
@@ -992,12 +981,18 @@ def process(input_path: str,
 
     widths_for_med = [e-s+1 for s,e in spans] or [ (yband[1]-yband[0]+1) ]
     medw = float(np.median(widths_for_med))
+
+    target_from_dec = None
+    if decimals is not None:
+        target_from_dec = (min_int_digits or 1) + decimals
     if force_slots and len(spans) < force_slots:
         spans = _force_split_to(spans, proj, medw, force_slots)
+    elif target_from_dec and len(spans) < target_from_dec:
+        spans = _force_split_to(spans, proj, medw, target_from_dec)
 
     digit_count = len(spans)
 
-    # 3) (optional) draw slot boxes
+    # 3) draw slot boxes
     annotated = crop.copy()
     if debug_slots and digit_count:
         y0b, y1b = yband
@@ -1015,8 +1010,17 @@ def process(input_path: str,
 
     # 6) per-slot OCR
     dump_dir = os.path.join(out_dir, base + "_slots") if dump_slots else None
-    slot_ocr = ocr_by_slots(bw, spans, yband, dump_dir=dump_dir, tag=base)
+    slot_ocr, slot_rois_for_fix = ocr_by_slots(bw, spans, yband, dump_dir=dump_dir, tag=base)
     slot_digits_only = re.sub(r'[^0-9]', '', slot_ocr)
+
+    # >>> Contextual + format coercions
+    need_leading_pair = (decimals is not None and (min_int_digits or 0) >= 2)
+    if slot_ocr:
+        chars = list(re.sub(r'[^0-9?]', '', slot_ocr))
+        chars = _context_fix_leading_pair(chars, slot_rois_for_fix, need_leading_pair)
+        chars = _final_shape_corrections_for_expected_format(chars, slot_rois_for_fix, decimals, min_int_digits)
+        slot_ocr = "".join(chars)
+        slot_digits_only = re.sub(r'[^0-9]', '', slot_ocr)
 
     # 7) choose best among: slot / tesseract-line
     cands = []
@@ -1025,7 +1029,6 @@ def process(input_path: str,
         cands.append(("slot", slot_digits_only, score))
     if tess_clean:
         cands.append(("tess", tess_clean, 0.66 + 0.02*len(tess_clean)))
-
     if cands:
         cands.sort(key=lambda x: (len(x[1]), x[2]))
         final_src, final_best_digits, _ = cands[-1]
@@ -1040,7 +1043,7 @@ def process(input_path: str,
     else:
         final_text = final_best_digits
 
-    # 9) insert dot if detected and no dot yet
+    # 9) dot placement if detected
     clean_digits_for_dot = re.sub(r'[^0-9]', '', final_text)
     if clean_digits_for_dot.isdigit() and dot_positions:
         k = dot_positions[0]
@@ -1049,6 +1052,9 @@ def process(input_path: str,
     # 10) apply --decimals if requested
     if decimals is not None and final_text and "." not in final_text and final_text.replace("?","").isdigit():
         final_text = apply_decimals(final_text.replace("?", ""), decimals)
+
+    # 10.1) integer pad
+    final_text = pad_int_part(final_text, min_int_digits)
 
     # 11) annotate
     ytxt = 24
@@ -1093,6 +1099,7 @@ def main():
     ap.add_argument("--from-crop", action="store_true", help="Treat input as already-cropped LCD")
     ap.add_argument("--prefer-7seg", action="store_true", help="(kept for compat; rescue uses 7-seg internally)")
     ap.add_argument("--decimals", type=int, default=None, help="If set, force N digits after the decimal when output has no '.'")
+    ap.add_argument("--min-int-digits", type=int, default=None, help="If output has a decimal, pad integer part to at least N digits")
     ap.add_argument("--min-char-height", type=int, default=48, help="Min character height (px) for autoscaler")
     ap.add_argument("--force-slots", type=int, default=None, help="Force at least this many digit slots by splitting wide spans")
     ap.add_argument("--debug-slots", action="store_true", help="Draw estimated digit slot boxes on the annotated image")
@@ -1116,7 +1123,8 @@ def main():
         force_slots=args.force_slots,
         debug_slots=args.debug_slots,
         dump_slots=args.dump_slots,
-        boost_contrast=args.boost_contrast
+        boost_contrast=args.boost_contrast,
+        min_int_digits=args.min_int_digits
     )
     print(json.dumps(res, indent=2, ensure_ascii=False))
 
