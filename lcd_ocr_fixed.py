@@ -6,6 +6,29 @@ from typing import Optional, Tuple, List
 import typing
 
 
+FAST_MODE = bool(int(os.environ.get("LCD_FAST_MODE", "0")))
+# Filled later by argparse --fast, but environment variable works too.
+
+class _Fast:
+    # Autoscale tries
+    SCALES_FAST = [6.5, 7.5]
+    # Per-slot jitter offsets tested
+    JITTERS_FAST = [0]            # from [-3..3] → [0]
+    # Limit number of per-slot variant ROIs (threshold/dilate combos)
+    MAX_VARIANTS_FAST = 10        # from ~40–60 → 10
+    # Skip rotation sweeps for 7-seg
+    ROTATIONS_FAST = []           # from ±1..±5 → []
+    # Avoid Tesseract single-char spam
+    MAX_TESS_ONE_CHAR_FAST = 4    # from up to ~48 → 4
+    # Skip strong line OCR unless absolutely needed
+    SKIP_LINE_OCR = True
+    # Connected components for dot detection is expensive on big canvases
+    SKIP_DOT_DETECT = True
+
+# Monkey patches via tiny wrappers (safe, local changes only)
+def _maybe_fast_list(full_list, fast_list):
+    return fast_list if FAST_MODE else full_list
+
 # ===== Reasonable limits (guards against over-segmentation) =====
 MAX_REASONABLE_SLOTS_DEFAULT = 8  # typical display width
 ABSURD_SLOTS_MARGIN = 2          # tolerate a little noise
